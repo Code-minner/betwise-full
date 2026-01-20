@@ -1,18 +1,63 @@
+// =============================================================
+// FILE: app/api/predictions/route.ts (FIXED)
+// =============================================================
+// 
+// FIXED: Uses existing supabase functions instead of non-existent ones
+// - getRecentPredictions → getRecentAnalyses
+// - savePrediction → saveAnalysis
+// - settlePrediction → updateAnalysisResult
+
 import { NextRequest, NextResponse } from 'next/server';
-import { getRecentPredictions, savePrediction, settlePrediction } from '@/lib/supabase';
-import { Sport, Prediction } from '@/lib/types';
+import { 
+  getRecentAnalyses, 
+  saveAnalysis, 
+  updateAnalysisResult,
+  AnalysisHistory 
+} from '@/lib/supabase';
 
 export async function GET(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url);
-    const sport = searchParams.get('sport') as Sport | null;
+    const sport = searchParams.get('sport');
     const limit = parseInt(searchParams.get('limit') || '50');
 
-    const predictions = await getRecentPredictions(sport || undefined, limit);
+    // Get recent analyses (predictions)
+    let predictions = await getRecentAnalyses(limit);
+
+    // Filter by sport if provided
+    if (sport && predictions.length > 0) {
+      predictions = predictions.filter(p => {
+        // Check if the market or selection contains the sport name
+        const marketLower = (p.market || '').toLowerCase();
+        const sportLower = sport.toLowerCase();
+        
+        // Simple sport detection based on market naming conventions
+        if (sportLower === 'football') {
+          return marketLower.includes('over') || 
+                 marketLower.includes('under') || 
+                 marketLower.includes('btts') ||
+                 marketLower.includes('winner') ||
+                 marketLower.includes('corner') ||
+                 marketLower.includes('double_chance');
+        }
+        if (sportLower === 'basketball') {
+          return marketLower.includes('total') || 
+                 marketLower.includes('spread') ||
+                 marketLower.includes('moneyline');
+        }
+        if (sportLower === 'tennis') {
+          return marketLower.includes('match_winner') || 
+                 marketLower.includes('games') ||
+                 marketLower.includes('upset');
+        }
+        return true;
+      });
+    }
 
     return NextResponse.json({
       success: true,
       predictions,
+      count: predictions.length,
     });
   } catch (error) {
     console.error('Error fetching predictions:', error);
@@ -27,16 +72,32 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { matchId, prediction } = body;
+    const { prediction } = body;
 
-    if (!matchId || !prediction) {
+    if (!prediction) {
       return NextResponse.json({
         success: false,
-        error: 'Missing matchId or prediction',
+        error: 'Missing prediction data',
       }, { status: 400 });
     }
 
-    const id = await savePrediction(matchId, prediction as Prediction);
+    // Convert to AnalysisHistory format
+    const analysis: AnalysisHistory = {
+      home_team: prediction.homeTeam || prediction.home_team || '',
+      away_team: prediction.awayTeam || prediction.away_team || '',
+      market: prediction.market || '',
+      selection: prediction.pick || prediction.selection || '',
+      line: prediction.line || null,
+      odds: prediction.bookmakerOdds || prediction.odds || 0,
+      probability: prediction.probability ? Math.round(prediction.probability * 100) : null,
+      confidence: prediction.confidence || null,
+      expected_value: prediction.edge || prediction.expected_value || null,
+      verdict: prediction.aiInsight || prediction.verdict || null,
+      data_quality: prediction.dataQuality || prediction.data_quality || null,
+      match_date: prediction.matchDate || prediction.match_date || null,
+    };
+
+    const id = await saveAnalysis(analysis);
 
     if (!id) {
       return NextResponse.json({
@@ -70,9 +131,14 @@ export async function PATCH(request: NextRequest) {
       }, { status: 400 });
     }
 
-    const success = await settlePrediction(predictionId, isCorrect, actualResult);
+    // Use existing updateAnalysisResult function
+    await updateAnalysisResult(
+      predictionId, 
+      actualResult || (isCorrect ? 'Won' : 'Lost'), 
+      isCorrect
+    );
 
-    return NextResponse.json({ success });
+    return NextResponse.json({ success: true });
   } catch (error) {
     console.error('Error settling prediction:', error);
     return NextResponse.json({

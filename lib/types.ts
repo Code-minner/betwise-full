@@ -1,18 +1,14 @@
 // =============================================================
-// FILE: lib/types.ts (FIXED - All exports added)
+// FILE: lib/types.ts (COMPLETE - All exports)
 // =============================================================
 // 
-// ADDED EXPORTS FOR analysis.ts:
-// - DataQuality
-// - RiskLevel
-// - ValueRating
-// - Market
-// - AnalysisFactors
-// - CONFIG
+// EXPORTS FOR:
+// - analysis.ts: DataQuality, RiskLevel, ValueRating, Market, AnalysisFactors, CONFIG
+// - api.ts: FootballMatch, BasketballMatch, TennisMatch, FootballStats, BasketballStats, Team, Player, Surface
 
 export type Sport = 'FOOTBALL' | 'BASKETBALL' | 'TENNIS';
 
-// ============== MISSING TYPES FOR analysis.ts ==============
+// ============== TYPES FOR analysis.ts ==============
 
 export type DataQuality = 'HIGH' | 'MEDIUM' | 'LOW' | 'NO_DATA' | 'FALLBACK';
 
@@ -53,10 +49,10 @@ export interface AnalysisFactors {
 
 export const CONFIG = {
   // Edge thresholds
-  STRONG_BET_EDGE: 0.10,      // 10%+
-  GOOD_VALUE_EDGE: 0.05,      // 5%+
-  FAIR_EDGE: 0.02,            // 2%+
-  POOR_VALUE_EDGE: 0,         // 0%+
+  STRONG_BET_EDGE: 0.10,
+  GOOD_VALUE_EDGE: 0.05,
+  FAIR_EDGE: 0.02,
+  POOR_VALUE_EDGE: 0,
   
   // Data quality thresholds
   HIGH_QUALITY_GAMES: 15,
@@ -76,6 +72,162 @@ export const CONFIG = {
   CACHE_TTL_MINUTES: 30,
   MAX_PREDICTIONS_PER_REQUEST: 50,
 };
+
+// ============== TYPES FOR api.ts ==============
+
+export type Surface = 'HARD' | 'CLAY' | 'GRASS' | 'INDOOR' | 'CARPET';
+
+export type MatchStatus = 'SCHEDULED' | 'LIVE' | 'FINISHED' | 'POSTPONED' | 'CANCELLED';
+
+export interface League {
+  id: number;
+  name: string;
+  country?: string;
+  sport: Sport;
+  logo?: string;
+}
+
+export interface Team {
+  id: string;
+  externalId?: string;
+  sport: Sport;
+  name: string;
+  shortName?: string;
+  logoUrl?: string;
+  country?: string;
+}
+
+export interface Player {
+  id: string;
+  externalId?: string;
+  name: string;
+  country?: string;
+  ranking?: number;
+  photoUrl?: string;
+}
+
+// ============== MATCH TYPES ==============
+
+export interface FootballMatch {
+  id: string;
+  externalId: string;
+  sport: 'FOOTBALL';
+  league: League;
+  status: MatchStatus;
+  kickoff: Date;
+  venue?: string;
+  homeTeam: Team;
+  awayTeam: Team;
+  result?: {
+    homeGoals: number;
+    awayGoals: number;
+    halfTimeHome?: number;
+    halfTimeAway?: number;
+  };
+}
+
+export interface BasketballMatch {
+  id: string;
+  externalId: string;
+  sport: 'BASKETBALL';
+  league: League;
+  status: MatchStatus;
+  kickoff: Date;
+  venue?: string;
+  homeTeam: Team;
+  awayTeam: Team;
+  result?: {
+    homePoints: number;
+    awayPoints: number;
+    quarters?: number[];
+  };
+}
+
+export interface TennisMatch {
+  id: string;
+  externalId: string;
+  sport: 'TENNIS';
+  tournament: {
+    id: number;
+    name: string;
+    category: string;
+    surface: Surface;
+  };
+  status: MatchStatus;
+  startTime: Date;
+  round: string;
+  player1: Player;
+  player2: Player;
+  result?: {
+    winner: 1 | 2;
+    sets: Array<{ player1: number; player2: number }>;
+  };
+}
+
+// ============== STATS TYPES ==============
+
+export interface FootballStats {
+  teamId: number;
+  teamName: string;
+  leagueId: number;
+  season: number;
+  form: string;
+  gamesPlayed: number;
+  wins: number;
+  draws: number;
+  losses: number;
+  goalsFor: number;
+  goalsAgainst: number;
+  avgGoalsFor: number;
+  avgGoalsAgainst: number;
+  cleanSheets: number;
+  failedToScore: number;
+  homeStats?: {
+    gamesPlayed: number;
+    wins: number;
+    draws: number;
+    losses: number;
+    goalsFor: number;
+    goalsAgainst: number;
+  };
+  awayStats?: {
+    gamesPlayed: number;
+    wins: number;
+    draws: number;
+    losses: number;
+    goalsFor: number;
+    goalsAgainst: number;
+  };
+}
+
+export interface BasketballStats {
+  teamId: number;
+  teamName: string;
+  leagueId: number;
+  season: string;
+  gamesPlayed: number;
+  pointsFor: number;
+  pointsAgainst: number;
+  avgPointsFor: number;
+  avgPointsAgainst: number;
+  homeAvgPoints?: number;
+  awayAvgPoints?: number;
+  pace?: number;
+  offRtg?: number;
+  defRtg?: number;
+}
+
+export interface TennisStats {
+  playerId: number;
+  playerName: string;
+  ranking: number;
+  winRate: number;
+  surfaceWinRates: Record<Surface, number>;
+  recentForm: string;
+  acesPct: number;
+  holdPct: number;
+  breakPct: number;
+}
 
 // ============== PREDICTION INTERFACE ==============
 
@@ -135,7 +287,7 @@ export interface Prediction {
     value: string;
   };
   
-  // Tennis specific (optional)
+  // Tennis specific
   player1?: { name: string; ranking?: number };
   player2?: { name: string; ranking?: number };
   tournament?: { name: string; surface: string };
@@ -150,7 +302,6 @@ export interface Prediction {
 
 // ============== LEAGUE CONSTANTS ==============
 
-// Football Leagues
 export const FOOTBALL_LEAGUES = [
   { id: 39, name: 'Premier League' },
   { id: 40, name: 'Championship' },
@@ -174,7 +325,6 @@ export const FOOTBALL_LEAGUES = [
   { id: 48, name: 'League Cup' },
 ];
 
-// Basketball Leagues
 export const BASKETBALL_LEAGUES = [
   { id: 12, name: 'NBA' },
   { id: 13, name: 'G League' },
@@ -191,7 +341,6 @@ export const BASKETBALL_LEAGUES = [
   { id: 202, name: 'CBA' },
 ];
 
-// Tennis Tournaments
 export const TENNIS_TOURNAMENTS = [
   { id: 1, name: 'Australian Open', category: 'Grand Slam' },
   { id: 2, name: 'French Open', category: 'Grand Slam' },
@@ -211,7 +360,6 @@ export const TENNIS_TOURNAMENTS = [
 
 // ============== UI CONFIG ==============
 
-// Category labels for UI
 export const CATEGORY_CONFIG = {
   LOW_RISK: {
     label: 'Low Risk',
@@ -245,7 +393,6 @@ export const CATEGORY_CONFIG = {
   },
 };
 
-// Data quality labels
 export const DATA_QUALITY_CONFIG = {
   HIGH: {
     label: 'High Quality',
@@ -274,7 +421,6 @@ export const DATA_QUALITY_CONFIG = {
   },
 };
 
-// Risk level labels
 export const RISK_LEVEL_CONFIG = {
   LOW: {
     label: 'Low Risk',
@@ -298,7 +444,6 @@ export const RISK_LEVEL_CONFIG = {
   },
 };
 
-// Value rating labels
 export const VALUE_RATING_CONFIG = {
   STRONG_BET: {
     label: 'Strong Bet',

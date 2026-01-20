@@ -11,6 +11,14 @@ export default function BasketballPage() {
   const [selectedLeague, setSelectedLeague] = useState<number | null>(null);
   const [aiEnhanced, setAiEnhanced] = useState(false);
   const [cached, setCached] = useState(false);
+  const [stats, setStats] = useState<{
+    total: number;
+    lowRisk: number;
+    value: number;
+    speculative: number;
+    avgConfidence: number;
+    avgEdge: number;
+  } | null>(null);
 
   useEffect(() => {
     fetchPredictions();
@@ -28,6 +36,7 @@ export default function BasketballPage() {
         setPredictions(data.predictions);
         setAiEnhanced(data.aiEnhanced || false);
         setCached(data.cached || false);
+        setStats(data.stats || null);
       } else {
         setError(data.error || 'Failed to fetch predictions');
       }
@@ -46,18 +55,22 @@ export default function BasketballPage() {
     return true;
   });
 
-  const bankers = filteredPredictions.filter(p => p.confidence >= 70);
-  const value = filteredPredictions.filter(p => p.confidence >= 50 && p.confidence < 70);
-  const risky = filteredPredictions.filter(p => p.confidence < 50);
+  // Group by category (from API) instead of confidence thresholds
+  const lowRisk = filteredPredictions.filter(p => p.category === 'LOW_RISK');
+  const value = filteredPredictions.filter(p => p.category === 'VALUE');
+  const speculative = filteredPredictions.filter(p => p.category === 'SPECULATIVE' || !p.category);
 
-  // Calculate average edge correctly
+  // Calculate average edge
   const calculateAvgEdge = () => {
     if (filteredPredictions.length === 0) return 0;
-    const totalEdge = filteredPredictions.reduce((a, p) => {
-      const edge = p.edge || 0;
-      return a + (Math.abs(edge) > 1 ? edge : edge * 100);
-    }, 0);
+    const totalEdge = filteredPredictions.reduce((a, p) => a + (p.edge || 0), 0);
     return totalEdge / filteredPredictions.length;
+  };
+
+  // Calculate average confidence
+  const calculateAvgConf = () => {
+    if (filteredPredictions.length === 0) return 0;
+    return Math.round(filteredPredictions.reduce((a, p) => a + p.confidence, 0) / filteredPredictions.length);
   };
 
   return (
@@ -118,21 +131,19 @@ export default function BasketballPage() {
             <p className="text-xl font-bold">{filteredPredictions.length}</p>
           </div>
           <div className="card text-center py-3">
-            <p className="text-dark-400 text-xs">Bankers</p>
-            <p className="text-xl font-bold text-green-400">{bankers.length}</p>
+            <p className="text-dark-400 text-xs">Low Risk</p>
+            <p className="text-xl font-bold text-green-400">{lowRisk.length}</p>
           </div>
           <div className="card text-center py-3">
             <p className="text-dark-400 text-xs">Avg Conf</p>
             <p className="text-xl font-bold text-primary-400">
-              {filteredPredictions.length > 0 
-                ? Math.round(filteredPredictions.reduce((a, p) => a + p.confidence, 0) / filteredPredictions.length)
-                : 0}%
+              {stats?.avgConfidence || calculateAvgConf()}%
             </p>
           </div>
           <div className="card text-center py-3">
             <p className="text-dark-400 text-xs">Avg Edge</p>
-            <p className="text-xl font-bold text-blue-400">
-              +{calculateAvgEdge().toFixed(1)}%
+            <p className={`text-xl font-bold ${(stats?.avgEdge || calculateAvgEdge()) >= 0 ? 'text-blue-400' : 'text-red-400'}`}>
+              {(stats?.avgEdge || calculateAvgEdge()) >= 0 ? '+' : ''}{(stats?.avgEdge || calculateAvgEdge()).toFixed(1)}%
             </p>
           </div>
         </div>
@@ -168,13 +179,14 @@ export default function BasketballPage() {
       {/* Predictions */}
       {!loading && !error && predictions.length > 0 && (
         <div className="space-y-8">
-          {bankers.length > 0 && (
+          {lowRisk.length > 0 && (
             <section>
               <h2 className="text-xl font-bold mb-4">
-                <span className="text-green-400">🔒</span> Bankers ({bankers.length})
+                <span className="text-green-400">🛡️</span> Low Risk ({lowRisk.length})
               </h2>
+              <p className="text-dark-500 text-sm mb-4">High confidence + positive edge vs bookmaker</p>
               <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
-                {bankers.map((p, i) => <PredictionCard key={i} prediction={p as any} />)}
+                {lowRisk.map((p, i) => <PredictionCard key={i} prediction={p as any} />)}
               </div>
             </section>
           )}
@@ -182,21 +194,23 @@ export default function BasketballPage() {
           {value.length > 0 && (
             <section>
               <h2 className="text-xl font-bold mb-4">
-                <span className="text-yellow-400">💰</span> Value ({value.length})
+                <span className="text-blue-400">💎</span> Value Bets ({value.length})
               </h2>
+              <p className="text-dark-500 text-sm mb-4">Good edge against bookmaker odds</p>
               <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
                 {value.map((p, i) => <PredictionCard key={i} prediction={p as any} />)}
               </div>
             </section>
           )}
 
-          {risky.length > 0 && (
+          {speculative.length > 0 && (
             <section>
               <h2 className="text-xl font-bold mb-4">
-                <span className="text-red-400">⚡</span> Risky ({risky.length})
+                <span className="text-yellow-400">⚡</span> Speculative ({speculative.length})
               </h2>
+              <p className="text-dark-500 text-sm mb-4">Lower confidence or marginal edge - proceed with caution</p>
               <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
-                {risky.map((p, i) => <PredictionCard key={i} prediction={p as any} />)}
+                {speculative.map((p, i) => <PredictionCard key={i} prediction={p as any} />)}
               </div>
             </section>
           )}

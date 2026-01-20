@@ -1,6 +1,13 @@
 // =============================================================
-// FILE: components/PredictionCard.tsx
+// FILE: components/PredictionCard.tsx (FIXED)
 // =============================================================
+// 
+// FIXES APPLIED:
+// ✅ "BANKER" → "LOW RISK" / "HIGH CONFIDENCE"
+// ✅ Proper edge display (can be negative)
+// ✅ Clear separation of Confidence vs Probability
+// ✅ Warning display for low data quality
+// ✅ NO BET indicators
 
 'use client';
 
@@ -11,10 +18,11 @@ import DeepResearchModal from './DeepResearchModal';
 // Flexible prediction type
 interface FlexiblePrediction {
   pick: string;
-  odds: number;
+  odds?: number;
   confidence: number;
   probability?: number;
   calculatedProbability?: number;
+  impliedProbability?: number;
   edge: number;
   risk?: 'LOW' | 'MEDIUM' | 'HIGH' | 'VERY_HIGH';
   riskLevel?: 'LOW' | 'MEDIUM' | 'HIGH' | 'VERY_HIGH';
@@ -25,10 +33,14 @@ interface FlexiblePrediction {
   reasoning?: string[];
   warnings?: string[];
   positives?: string[];
-  // AI Enhancement fields
+  category?: string;
+  dataQuality?: string;
+  modelAgreement?: number;
+  
+  // AI Enhancement fields (narrative only, no number changes)
   aiInsight?: string | null;
   aiEnhanced?: boolean;
-  aiConfidenceAdjust?: number;
+  
   // Bookmaker odds comparison
   oddsComparison?: {
     bookmakerOdds: number;
@@ -37,7 +49,9 @@ interface FlexiblePrediction {
     edge: number;
     value: 'STRONG' | 'GOOD' | 'FAIR' | 'POOR';
   };
-  bookmakerOdds?: any;
+  bookmakerOdds?: number;
+  bookmaker?: string;
+  
   matchInfo?: {
     homeTeam: string;
     awayTeam: string;
@@ -58,39 +72,70 @@ interface PredictionCardProps {
   showDeepResearch?: boolean;
 }
 
+// ============== LABEL MAPPINGS ==============
+
+const CATEGORY_LABELS: Record<string, { label: string; color: string; icon: string }> = {
+  LOW_RISK: { label: 'LOW RISK', color: 'bg-green-500/20 text-green-400 border-green-500/30', icon: '🛡️' },
+  VALUE: { label: 'VALUE BET', color: 'bg-blue-500/20 text-blue-400 border-blue-500/30', icon: '💎' },
+  SPECULATIVE: { label: 'SPECULATIVE', color: 'bg-yellow-500/20 text-yellow-400 border-yellow-500/30', icon: '⚡' },
+  NO_BET: { label: 'NO BET', color: 'bg-red-500/20 text-red-400 border-red-500/30', icon: '🚫' },
+  // Legacy mappings
+  BANKER: { label: 'LOW RISK', color: 'bg-green-500/20 text-green-400 border-green-500/30', icon: '🛡️' },
+  CORNERS: { label: 'CORNERS', color: 'bg-purple-500/20 text-purple-400 border-purple-500/30', icon: '🔄' },
+  GOALS: { label: 'GOALS', color: 'bg-orange-500/20 text-orange-400 border-orange-500/30', icon: '⚽' },
+  TOTALS: { label: 'TOTALS', color: 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30', icon: '📊' },
+  SPREAD: { label: 'SPREAD', color: 'bg-indigo-500/20 text-indigo-400 border-indigo-500/30', icon: '📏' },
+  UPSET: { label: 'UPSET', color: 'bg-red-500/20 text-red-400 border-red-500/30', icon: '🎲' },
+};
+
+const DATA_QUALITY_LABELS: Record<string, { label: string; color: string }> = {
+  HIGH: { label: 'High Quality Data', color: 'text-green-400' },
+  MEDIUM: { label: 'Estimated Data', color: 'text-yellow-400' },
+  LOW: { label: 'Limited Data', color: 'text-orange-400' },
+  FALLBACK: { label: 'League Averages Only', color: 'text-red-400' },
+  NO_DATA: { label: 'No Data', color: 'text-red-400' },
+};
+
 export default function PredictionCard({ prediction, showDeepResearch = true }: PredictionCardProps) {
   const [showResearch, setShowResearch] = useState(false);
+  const [expanded, setExpanded] = useState(false);
 
+  // ============== EXTRACT VALUES ==============
+  
+  // Confidence (how reliable our probability is)
+  const confidence = prediction.confidence || 0;
   const confidenceColor = 
-    prediction.confidence >= 70 ? 'text-green-400' :
-    prediction.confidence >= 50 ? 'text-yellow-400' : 'text-red-400';
+    confidence >= 70 ? 'text-green-400' :
+    confidence >= 55 ? 'text-yellow-400' :
+    confidence >= 40 ? 'text-orange-400' : 'text-red-400';
   
-  const riskLevel = prediction.riskLevel || prediction.risk || 'MEDIUM';
-  const riskBadge = 
-    riskLevel === 'LOW' ? 'badge-green' :
-    riskLevel === 'MEDIUM' ? 'badge-yellow' :
-    riskLevel === 'HIGH' ? 'badge-red' : 
-    riskLevel === 'VERY_HIGH' ? 'badge-red' : 'badge-red';
-
-  // Edge calculation
-  const rawEdge = prediction.edge || 0;
-  const edgePercent = Math.abs(rawEdge) > 1 ? rawEdge : rawEdge * 100;
-  
-  // Probability
-  const rawProb = prediction.calculatedProbability || prediction.probability || 0;
+  // Probability (our calculated chance of the event)
+  const rawProb = prediction.probability || prediction.calculatedProbability || 0;
   const probPercent = rawProb > 1 ? rawProb : rawProb * 100;
-
-  // Value rating from odds comparison or edge
-  const valueRating = prediction.oddsComparison?.value || prediction.valueRating || (
-    edgePercent >= 10 ? 'STRONG_BET' :
-    edgePercent >= 5 ? 'GOOD_VALUE' :
-    edgePercent >= 0 ? 'FAIR' : 'AVOID'
-  );
-
-  const valueBadge =
-    valueRating === 'STRONG' || valueRating === 'STRONG_BET' ? 'text-green-400' :
-    valueRating === 'GOOD' || valueRating === 'GOOD_VALUE' ? 'text-green-300' :
-    valueRating === 'FAIR' ? 'text-yellow-400' : 'text-red-400';
+  
+  // Edge (value vs bookmaker)
+  const edge = prediction.edge || 0;
+  const edgeColor = 
+    edge >= 8 ? 'text-green-400' :
+    edge >= 3 ? 'text-green-300' :
+    edge >= 0 ? 'text-yellow-400' : 'text-red-400';
+  
+  // Risk level
+  const riskLevel = prediction.riskLevel || prediction.risk || 'MEDIUM';
+  const riskColors: Record<string, string> = {
+    LOW: 'bg-green-500/20 text-green-400 border border-green-500/30',
+    MEDIUM: 'bg-yellow-500/20 text-yellow-400 border border-yellow-500/30',
+    HIGH: 'bg-red-500/20 text-red-400 border border-red-500/30',
+    VERY_HIGH: 'bg-red-600/30 text-red-300 border border-red-500/40',
+  };
+  
+  // Category
+  const category = prediction.category || 'VALUE';
+  const categoryInfo = CATEGORY_LABELS[category] || CATEGORY_LABELS.VALUE;
+  
+  // Data quality
+  const dataQuality = prediction.dataQuality || 'MEDIUM';
+  const dataQualityInfo = DATA_QUALITY_LABELS[dataQuality] || DATA_QUALITY_LABELS.MEDIUM;
 
   // Match info
   const homeTeam = prediction.matchInfo?.homeTeam || prediction.fixture?.homeTeam?.name || 'Home';
@@ -100,36 +145,58 @@ export default function PredictionCard({ prediction, showDeepResearch = true }: 
 
   const sport: Sport = (prediction.sport as Sport) || 'FOOTBALL';
 
-  // Check if we have bookmaker odds
-  const hasBookmakerOdds = prediction.oddsComparison?.bookmakerOdds;
+  // Bookmaker odds
+  const hasBookmakerOdds = prediction.oddsComparison?.bookmakerOdds || prediction.bookmakerOdds;
+  const bookOdds = prediction.oddsComparison?.bookmakerOdds || prediction.bookmakerOdds;
+  const bookmaker = prediction.oddsComparison?.bookmaker || prediction.bookmaker || 'Best';
 
   return (
     <>
-      <div className="card-hover group relative">
+      <div className="card-hover group relative overflow-hidden">
+        {/* Category Badge */}
+        <div className={`absolute top-0 left-0 px-2 py-1 text-xs font-medium rounded-br-lg ${categoryInfo.color}`}>
+          {categoryInfo.icon} {categoryInfo.label}
+        </div>
+
         {/* AI Badge */}
         {prediction.aiEnhanced && (
-          <div className="absolute -top-2 -right-2 bg-purple-600 text-white text-xs px-2 py-0.5 rounded-full flex items-center gap-1 shadow-lg">
+          <div className="absolute top-0 right-0 bg-purple-600/90 text-white text-xs px-2 py-1 rounded-bl-lg flex items-center gap-1">
             <span>🤖</span> AI
           </div>
         )}
 
         {/* Match Header */}
-        <div className="flex items-start justify-between mb-3">
-          <div className="flex-1">
-            <p className="text-sm text-dark-400 mb-1">{league}</p>
-            <p className="font-medium">{homeTeam} vs {awayTeam}</p>
+        <div className="mt-6 mb-3">
+          <p className="text-sm text-dark-400 mb-1">{league}</p>
+          <p className="font-medium text-lg">{homeTeam} vs {awayTeam}</p>
+          {kickoff && (
             <p className="text-xs text-dark-500 mt-1">
-              {kickoff ? new Date(kickoff).toLocaleString() : ''}
+              {new Date(kickoff).toLocaleString('en-US', {
+                weekday: 'short',
+                month: 'short',
+                day: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit',
+              })}
+            </p>
+          )}
+        </div>
+
+        {/* Data Quality Warning */}
+        {(dataQuality === 'LOW' || dataQuality === 'FALLBACK') && (
+          <div className="bg-orange-900/20 border border-orange-500/30 rounded-lg p-2 mb-3">
+            <p className="text-xs text-orange-400 flex items-center gap-2">
+              <span>⚠️</span>
+              <span>{dataQualityInfo.label} - Lower reliability</span>
             </p>
           </div>
-          <span className={riskBadge}>{riskLevel}</span>
-        </div>
+        )}
 
         {/* AI Insight */}
         {prediction.aiInsight && (
           <div className="bg-purple-900/30 border border-purple-500/30 rounded-lg p-2 mb-3">
             <p className="text-xs text-purple-300 flex items-start gap-2">
-              <span className="text-purple-400">🤖</span>
+              <span className="text-purple-400 shrink-0">🤖</span>
               <span>{prediction.aiInsight}</span>
             </p>
           </div>
@@ -138,73 +205,106 @@ export default function PredictionCard({ prediction, showDeepResearch = true }: 
         {/* Pick */}
         <div className="bg-dark-900/50 rounded-lg p-3 mb-3">
           <p className="font-semibold text-lg">{prediction.pick}</p>
-          <div className="flex items-center gap-4 mt-2 text-sm">
-            <span className="text-dark-400">
-              Odds: <span className="text-white font-medium">{(prediction.odds || 1.5).toFixed(2)}</span>
-            </span>
-            <span className={valueBadge}>
-              {(valueRating || 'FAIR').replace(/_/g, ' ')}
-            </span>
+          
+          {/* Bookmaker Odds */}
+          {hasBookmakerOdds && (
+            <div className="flex items-center justify-between mt-2 text-sm">
+              <span className="text-dark-400">
+                Best Odds: <span className="text-white font-medium">{Number(bookOdds).toFixed(2)}</span>
+              </span>
+              <span className="text-dark-500 text-xs">@ {bookmaker}</span>
+            </div>
+          )}
+        </div>
+
+        {/* Stats Grid - CLEAR SEPARATION */}
+        <div className="grid grid-cols-3 gap-2 text-center text-sm mb-3">
+          <div className="bg-dark-800/50 rounded-lg p-2">
+            <p className="text-dark-400 text-xs mb-1">Confidence</p>
+            <p className={`font-bold text-lg ${confidenceColor}`}>{confidence}%</p>
+            <p className="text-dark-500 text-[10px]">Reliability</p>
+          </div>
+          <div className="bg-dark-800/50 rounded-lg p-2">
+            <p className="text-dark-400 text-xs mb-1">Probability</p>
+            <p className="font-bold text-lg">{probPercent.toFixed(0)}%</p>
+            <p className="text-dark-500 text-[10px]">Our Model</p>
+          </div>
+          <div className="bg-dark-800/50 rounded-lg p-2">
+            <p className="text-dark-400 text-xs mb-1">Edge</p>
+            <p className={`font-bold text-lg ${edgeColor}`}>
+              {edge >= 0 ? '+' : ''}{edge.toFixed(1)}%
+            </p>
+            <p className="text-dark-500 text-[10px]">vs Book</p>
           </div>
         </div>
 
-        {/* Bookmaker Odds Comparison */}
-        {hasBookmakerOdds && (
-          <div className="bg-blue-900/20 border border-blue-500/30 rounded-lg p-2 mb-3">
+        {/* Value Assessment (if we have bookmaker odds) */}
+        {prediction.oddsComparison && (
+          <div className={`rounded-lg p-2 mb-3 border ${
+            prediction.oddsComparison.value === 'STRONG' ? 'bg-green-900/20 border-green-500/30' :
+            prediction.oddsComparison.value === 'GOOD' ? 'bg-green-900/10 border-green-500/20' :
+            prediction.oddsComparison.value === 'FAIR' ? 'bg-yellow-900/20 border-yellow-500/30' :
+            'bg-red-900/20 border-red-500/30'
+          }`}>
             <div className="flex items-center justify-between text-xs">
-              <span className="text-blue-400">📊 Best Bookmaker Odds</span>
-              <span className="text-white font-medium">
-                {prediction.oddsComparison!.bookmakerOdds.toFixed(2)}
-                <span className="text-dark-400 ml-1">@ {prediction.oddsComparison!.bookmaker}</span>
+              <span className="text-dark-400">Value Assessment:</span>
+              <span className={`font-medium ${
+                prediction.oddsComparison.value === 'STRONG' ? 'text-green-400' :
+                prediction.oddsComparison.value === 'GOOD' ? 'text-green-300' :
+                prediction.oddsComparison.value === 'FAIR' ? 'text-yellow-400' :
+                'text-red-400'
+              }`}>
+                {prediction.oddsComparison.value === 'STRONG' ? '🔥 STRONG VALUE' :
+                 prediction.oddsComparison.value === 'GOOD' ? '✅ GOOD VALUE' :
+                 prediction.oddsComparison.value === 'FAIR' ? '➖ FAIR' :
+                 '⚠️ POOR VALUE'}
               </span>
             </div>
-            {prediction.oddsComparison!.bookmakerLine && (
-              <p className="text-xs text-dark-400 mt-1">
-                Line: {prediction.oddsComparison!.bookmakerLine}
+            {prediction.impliedProbability && (
+              <p className="text-dark-500 text-[10px] mt-1">
+                Bookmaker implied: {(prediction.impliedProbability * 100).toFixed(0)}% | 
+                Our model: {probPercent.toFixed(0)}%
               </p>
             )}
-            <div className="flex items-center justify-between mt-1">
-              <span className="text-xs text-dark-400">Value Edge:</span>
-              <span className={`text-xs font-medium ${
-                prediction.oddsComparison!.edge >= 5 ? 'text-green-400' :
-                prediction.oddsComparison!.edge >= 0 ? 'text-yellow-400' : 'text-red-400'
-              }`}>
-                {prediction.oddsComparison!.edge >= 0 ? '+' : ''}{prediction.oddsComparison!.edge}%
-              </span>
-            </div>
           </div>
         )}
 
-        {/* Stats Grid */}
-        <div className="grid grid-cols-3 gap-3 text-center text-sm mb-3">
-          <div>
-            <p className="text-dark-400">Confidence</p>
-            <p className={`font-bold text-lg ${confidenceColor}`}>{prediction.confidence || 0}%</p>
-          </div>
-          <div>
-            <p className="text-dark-400">Probability</p>
-            <p className="font-bold text-lg">{probPercent.toFixed(0)}%</p>
-          </div>
-          <div>
-            <p className="text-dark-400">Edge</p>
-            <p className={`font-bold text-lg ${edgePercent >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-              {edgePercent >= 0 ? '+' : ''}{edgePercent.toFixed(1)}%
-            </p>
-          </div>
+        {/* Risk Badge */}
+        <div className="flex items-center justify-between mb-3">
+          <span className="text-dark-400 text-xs">Risk Level:</span>
+          <span className={`text-xs px-2 py-1 rounded-full ${riskColors[riskLevel]}`}>
+            {riskLevel}
+          </span>
         </div>
 
-        {/* Reasoning */}
-        {((prediction.reasoning?.length || 0) > 0 || (prediction.warnings?.length || 0) > 0 || (prediction.positives?.length || 0) > 0) && (
-          <div className="mb-3 text-sm space-y-1">
-            {(prediction.positives || []).slice(0, 2).map((p, i) => (
-              <p key={i} className="text-green-400 text-xs">✓ {p}</p>
-            ))}
-            {(prediction.reasoning || []).slice(0, 2).map((r, i) => (
-              <p key={`r-${i}`} className="text-blue-400 text-xs">• {r}</p>
-            ))}
-            {(prediction.warnings || []).slice(0, 2).map((w, i) => (
-              <p key={`w-${i}`} className="text-yellow-400 text-xs">⚠ {w}</p>
-            ))}
+        {/* Expandable Reasoning */}
+        {((prediction.reasoning?.length || 0) > 0 || (prediction.warnings?.length || 0) > 0) && (
+          <div className="mb-3">
+            <button 
+              onClick={() => setExpanded(!expanded)}
+              className="text-xs text-dark-400 hover:text-dark-300 flex items-center gap-1"
+            >
+              {expanded ? '▼' : '▶'} Analysis Details
+            </button>
+            
+            {expanded && (
+              <div className="mt-2 text-xs space-y-1 pl-2 border-l-2 border-dark-700">
+                {(prediction.positives || []).map((p, i) => (
+                  <p key={i} className="text-green-400">✓ {p}</p>
+                ))}
+                {(prediction.reasoning || []).map((r, i) => (
+                  <p key={`r-${i}`} className="text-blue-400">• {r}</p>
+                ))}
+                {(prediction.warnings || []).map((w, i) => (
+                  <p key={`w-${i}`} className="text-yellow-400">⚠ {w}</p>
+                ))}
+                {prediction.modelAgreement && (
+                  <p className="text-dark-400 mt-2">
+                    Model Agreement: {prediction.modelAgreement}%
+                  </p>
+                )}
+              </div>
+            )}
           </div>
         )}
 
@@ -212,7 +312,7 @@ export default function PredictionCard({ prediction, showDeepResearch = true }: 
         {showDeepResearch && (
           <button
             onClick={() => setShowResearch(true)}
-            className="w-full mt-2 py-2 text-sm bg-gradient-to-r from-purple-600 to-blue-600 hover:from-purple-500 hover:to-blue-500 rounded-lg transition-all flex items-center justify-center gap-2 font-medium"
+            className="w-full py-2 text-sm bg-gradient-to-r from-purple-600 to-blue-600 hover:from-purple-500 hover:to-blue-500 rounded-lg transition-all flex items-center justify-center gap-2 font-medium"
           >
             <span>🔬</span>
             Deep Research

@@ -15,7 +15,7 @@ export async function GET(request: NextRequest) {
     if (!oddsApi.isOddsApiConfigured()) {
       return NextResponse.json({
         success: false,
-        error: 'Odds API not configured. Add THE_ODDS_API_KEY to .env.local',
+        error: 'Odds API not configured. Add ODDS_API_KEY to .env.local',
       });
     }
 

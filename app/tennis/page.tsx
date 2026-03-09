@@ -3,6 +3,15 @@
 import { useState, useEffect } from 'react';
 import { Prediction } from '@/lib/types';
 import PredictionCard from '@/components/PredictionCard';
+import PerformanceSummary from '@/components/PerformanceSummary';
+
+interface EvaluationData {
+  performance: any;
+  calibration: any;
+  recentResults: any[];
+  newlyEvaluated: number;
+  success: boolean;
+}
 
 export default function TennisPage() {
   const [predictions, setPredictions] = useState<Prediction[]>([]);
@@ -11,6 +20,7 @@ export default function TennisPage() {
   const [selectedCategory, setSelectedCategory] = useState<'ALL' | 'WINNER' | 'GAMES'>('ALL');
   const [aiEnhanced, setAiEnhanced] = useState(false);
   const [cached, setCached] = useState(false);
+  const [evaluation, setEvaluation] = useState<EvaluationData | null>(null);
   const [stats, setStats] = useState<{
     total: number;
     lowRisk: number;
@@ -19,6 +29,7 @@ export default function TennisPage() {
     upsets: number;
     avgConfidence: number;
     avgEdge: number;
+    calibrated?: number;
   } | null>(null);
 
   useEffect(() => {
@@ -38,6 +49,7 @@ export default function TennisPage() {
         setAiEnhanced(data.aiEnhanced || false);
         setCached(data.cached || false);
         setStats(data.stats || null);
+        setEvaluation(data.evaluation || null);
       } else {
         setError(data.error || 'Failed to fetch predictions');
       }
@@ -48,31 +60,28 @@ export default function TennisPage() {
     }
   }
 
-  // Filter predictions
   const filteredPredictions = predictions.filter(p => {
     if (selectedCategory === 'WINNER' && !p.market.includes('WINNER') && !p.market.includes('UPSET')) return false;
     if (selectedCategory === 'GAMES' && !p.market.includes('GAMES')) return false;
     return true;
   });
 
-  // Group by category (from API) instead of confidence thresholds
   const lowRisk = filteredPredictions.filter(p => p.category === 'LOW_RISK');
   const value = filteredPredictions.filter(p => p.category === 'VALUE');
   const speculative = filteredPredictions.filter(p => p.category === 'SPECULATIVE' || !p.category);
   const upsets = filteredPredictions.filter(p => p.category === 'UPSET');
 
-  // Calculate average edge
   const calculateAvgEdge = () => {
     if (filteredPredictions.length === 0) return 0;
-    const totalEdge = filteredPredictions.reduce((a, p) => a + (p.edge || 0), 0);
-    return totalEdge / filteredPredictions.length;
+    return filteredPredictions.reduce((a, p) => a + (p.edge || 0), 0) / filteredPredictions.length;
   };
 
-  // Calculate average confidence
   const calculateAvgConf = () => {
     if (filteredPredictions.length === 0) return 0;
     return Math.round(filteredPredictions.reduce((a, p) => a + p.confidence, 0) / filteredPredictions.length);
   };
+
+  const hasCalibration = evaluation?.calibration?.isReliable;
 
   return (
     <div className="space-y-8">
@@ -84,6 +93,11 @@ export default function TennisPage() {
             {aiEnhanced && (
               <span className="text-sm bg-purple-600 text-white px-2 py-1 rounded-full flex items-center gap-1">
                 🤖 AI Enhanced
+              </span>
+            )}
+            {hasCalibration && (
+              <span className="text-sm bg-emerald-600 text-white px-2 py-1 rounded-full flex items-center gap-1">
+                🎯 Calibrated
               </span>
             )}
           </h1>
@@ -110,6 +124,17 @@ export default function TennisPage() {
         </div>
       </div>
 
+      {/* Performance Summary (Evaluation Feedback) */}
+      {evaluation && (
+        <PerformanceSummary
+          performance={evaluation.performance}
+          calibration={evaluation.calibration}
+          recentResults={evaluation.recentResults}
+          newlyEvaluated={evaluation.newlyEvaluated}
+          sport="TENNIS"
+        />
+      )}
+
       {/* Filters */}
       <div className="flex flex-wrap gap-4">
         <div className="flex rounded-lg overflow-hidden border border-dark-600">
@@ -131,7 +156,7 @@ export default function TennisPage() {
 
       {/* Stats */}
       {predictions.length > 0 && (
-        <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+        <div className="grid grid-cols-2 md:grid-cols-6 gap-4">
           <div className="card text-center py-3">
             <p className="text-dark-400 text-xs">Total</p>
             <p className="text-xl font-bold">{filteredPredictions.length}</p>
@@ -154,6 +179,12 @@ export default function TennisPage() {
             <p className="text-dark-400 text-xs">Avg Edge</p>
             <p className={`text-xl font-bold ${(stats?.avgEdge || calculateAvgEdge()) >= 0 ? 'text-blue-400' : 'text-red-400'}`}>
               {(stats?.avgEdge || calculateAvgEdge()) >= 0 ? '+' : ''}{(stats?.avgEdge || calculateAvgEdge()).toFixed(1)}%
+            </p>
+          </div>
+          <div className="card text-center py-3">
+            <p className="text-dark-400 text-xs">Calibrated</p>
+            <p className="text-xl font-bold text-emerald-400">
+              {stats?.calibrated || 0}
             </p>
           </div>
         </div>

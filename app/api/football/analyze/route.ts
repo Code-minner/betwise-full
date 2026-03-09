@@ -1,13 +1,14 @@
 // =============================================================
-// FILE: app/api/football/analyze/route.ts (FIXED)
+// FILE: app/api/football/analyze/route.ts (v2 — WITH EVALUATION)
 // =============================================================
-// 
-// FIXES APPLIED:
-// ✅ AI NEVER modifies confidence, probability, or edge
-// ✅ AI only provides narrative insights
-// ✅ Proper edge calculation using bookmaker odds
-// ✅ NO BET filtering (edge < 3% with odds = filtered out)
-// ✅ Category labels: LOW_RISK, VALUE, SPECULATIVE (not BANKER)
+//
+// CHANGES FROM v1:
+// ✅ Background evaluation runs during analysis
+// ✅ Calibration profile adjusts prediction confidence
+// ✅ Performance stats returned alongside predictions
+// ✅ isRunning guard prevents double execution
+// ✅ Recent results included in response
+//
 
 import { NextResponse } from 'next/server';
 import {
@@ -19,12 +20,30 @@ import {
   BookmakerOdds,
 } from '@/lib/football';
 
+// Background evaluation + calibration
+import {
+  runBackgroundEvaluation,
+  getCachedCalibration,
+  getCachedPerformance,
+  serializeEvalResult,
+  type BackgroundEvalResult,
+} from '@/lib/background-eval';
+import {
+  applyCalibratedProbability,
+  applyCalibratedConfidence,
+  type CalibrationProfile,
+} from '@/lib/calibration';
+
 // Optional dependencies - graceful degradation
 let saveAnalysisBatch: ((a: AnalysisRecord[]) => Promise<void>) | null = null;
 let trackApiUsage: ((api: string, endpoint: string) => Promise<void>) | null = null;
 let getBatchOddsAsArray: ((sportKey: string) => Promise<OddsRecord[]>) | null = null;
 let findOddsForTeams: ((oddsArray: OddsRecord[], home: string, away: string) => OddsRecord | null) | null = null;
 let LEAGUE_TO_SPORT_KEY: { [key: number]: string } = {};
+
+// Supabase for saving to predictions table
+let supabase: any = null;
+let isSupabaseConfigured: (() => boolean) | null = null;
 
 interface AnalysisRecord {
   home_team: string;
@@ -58,6 +77,8 @@ try {
   const sb = require('@/lib/supabase');
   saveAnalysisBatch = sb.saveAnalysisBatch;
   trackApiUsage = sb.trackApiUsage;
+  supabase = sb.supabase;
+  isSupabaseConfigured = sb.isSupabaseConfigured;
 } catch {}
 
 try {
@@ -70,36 +91,29 @@ try {
 const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
 const GROQ_MODEL = 'llama-3.3-70b-versatile';
 
-// ============== PREDICTION TYPE (FIXED) ==============
+// ============== isRunning GUARD ==============
+let isRunning = false;
+
+// ============== PREDICTION TYPE ==============
 
 interface EnhancedPrediction {
   matchId: string;
   sport: string;
   market: string;
   pick: string;
-  
-  // Core numbers - NEVER modified by AI
   probability: number;
   confidence: number;
   edge: number;
   impliedProbability?: number;
-  
-  // Bookmaker data
   bookmakerOdds?: number;
   bookmaker?: string;
-  
-  // Risk & Category
   riskLevel: string;
-  category: string;          // LOW_RISK | VALUE | SPECULATIVE | NO_BET
+  category: string;
   dataQuality: string;
   modelAgreement: number;
-  
-  // Reasoning
   reasoning: string[];
   warnings: string[];
   positives: string[];
-  
-  // Match info
   matchInfo: {
     homeTeam: string;
     awayTeam: string;
@@ -107,13 +121,13 @@ interface EnhancedPrediction {
     leagueId: number;
     kickoff: Date;
   };
-  
-  // AI Enhancement - NARRATIVE ONLY
-  aiInsight?: string | null;  // AI provides text insight
-  aiEnhanced: boolean;        // Flag if AI analyzed
-  // REMOVED: aiConfidenceAdjust - AI CANNOT modify numbers
-  
-  // Odds comparison (if available)
+  aiInsight?: string | null;
+  aiEnhanced: boolean;
+  // NEW: Calibration metadata
+  calibrationApplied?: boolean;
+  rawProbability?: number;    // Before calibration
+  rawConfidence?: number;     // Before calibration
+  calibrationNote?: string;
   oddsComparison?: {
     bookmakerOdds: number;
     bookmakerLine?: number;
@@ -124,40 +138,41 @@ interface EnhancedPrediction {
 }
 
 let cachedPredictions: EnhancedPrediction[] | null = null;
+let cachedEvalResult: BackgroundEvalResult | null = null;
 let cacheTime = 0;
 const CACHE_DURATION = 30 * 60 * 1000;
 
 // ============== CONVERT SUGGESTION TO API FORMAT ==============
 
-function convertToApiFormat(p: FootballSuggestion): EnhancedPrediction {
+function convertToApiFormat(
+  p: FootballSuggestion,
+  calibration: CalibrationProfile | null
+): EnhancedPrediction {
+  const rawProb = p.probability;
+  const rawConf = p.confidence;
+
+  // Apply calibration correction
+  const calibResult = applyCalibratedProbability(rawProb, calibration);
+  const calibConf = applyCalibratedConfidence(rawConf, rawProb, calibration);
+
   return {
     matchId: String(p.fixture.id),
     sport: 'FOOTBALL',
     market: p.market,
     pick: p.pick,
-    
-    // Core numbers (from model, not modified)
-    probability: p.probability,
-    confidence: p.confidence,
+    probability: calibResult.adjusted,
+    confidence: calibConf,
     edge: p.edge,
     impliedProbability: p.impliedProbability,
-    
-    // Bookmaker data
     bookmakerOdds: p.bookmakerOdds,
     bookmaker: p.bookmaker,
-    
-    // Risk & Category
     riskLevel: p.risk,
     category: p.category,
     dataQuality: p.dataQuality,
     modelAgreement: p.modelAgreement,
-    
-    // Reasoning
     reasoning: p.reasoning,
     warnings: p.warnings,
     positives: p.reasoning.filter(r => !r.includes('warning')),
-    
-    // Match info
     matchInfo: {
       homeTeam: p.fixture.homeTeam.name,
       awayTeam: p.fixture.awayTeam.name,
@@ -165,18 +180,21 @@ function convertToApiFormat(p: FootballSuggestion): EnhancedPrediction {
       leagueId: p.fixture.league.id,
       kickoff: p.fixture.kickoff,
     },
-    
-    // AI (not yet enhanced)
     aiInsight: null,
     aiEnhanced: false,
+    // Calibration metadata
+    calibrationApplied: calibResult.correctionApplied,
+    rawProbability: calibResult.correctionApplied ? rawProb : undefined,
+    rawConfidence: calibResult.correctionApplied ? rawConf : undefined,
+    calibrationNote: calibResult.correctionApplied ? calibResult.correctionNote : undefined,
   };
 }
 
-// ============== AI ENHANCEMENT (INSIGHT ONLY - NO NUMBER CHANGES) ==============
+// ============== AI ENHANCEMENT (INSIGHT ONLY) ==============
 
 async function enhanceWithAI(predictions: EnhancedPrediction[]): Promise<EnhancedPrediction[]> {
   if (!GROQ_API_KEY || GROQ_API_KEY.length < 20) {
-    return predictions.map((p) => ({ ...p, aiInsight: null, aiEnhanced: false }));
+    return predictions.map(p => ({ ...p, aiInsight: null, aiEnhanced: false }));
   }
 
   const enhanced: EnhancedPrediction[] = [];
@@ -209,11 +227,10 @@ async function enhanceWithAI(predictions: EnhancedPrediction[]): Promise<Enhance
 RULES:
 - DO NOT suggest confidence adjustments
 - DO NOT provide numerical changes
-- DO NOT say "increase" or "decrease" confidence
 - ONLY provide contextual insight about the match/teams
 - Keep insights under 100 characters
 
-Return JSON array: [{"insight":"Brief contextual insight about this pick"},...]`,
+Return JSON array: [{"insight":"Brief contextual insight"},...]`,
             },
             { role: 'user', content: `Analyze these picks:\n${summary}\n\nJSON only.` },
           ],
@@ -231,19 +248,10 @@ Return JSON array: [{"insight":"Brief contextual insight about this pick"},...]`
           try {
             const results = JSON.parse(match[0]);
             for (let j = 0; j < batch.length; j++) {
-              const p = batch[j];
               const ai = results[j] || {};
-              
-              // AI ONLY provides insight text - NEVER modifies numbers
-              enhanced.push({
-                ...p,
-                aiInsight: ai.insight || null,
-                aiEnhanced: true,
-                // confidence STAYS THE SAME - no aiConfidenceAdjust
-              });
+              enhanced.push({ ...batch[j], aiInsight: ai.insight || null, aiEnhanced: true });
             }
           } catch {
-            // JSON parse failed, add without AI
             enhanced.push(...batch.map(p => ({ ...p, aiEnhanced: false })));
           }
         } else {
@@ -257,7 +265,7 @@ Return JSON array: [{"insight":"Brief contextual insight about this pick"},...]`
     }
 
     if (i + batchSize < predictions.length) {
-      await new Promise((r) => setTimeout(r, 300));
+      await new Promise(r => setTimeout(r, 300));
     }
   }
 
@@ -269,7 +277,6 @@ Return JSON array: [{"insight":"Brief contextual insight about this pick"},...]`
 async function addOdds(predictions: EnhancedPrediction[]): Promise<EnhancedPrediction[]> {
   if (!getBatchOddsAsArray || !findOddsForTeams) return predictions;
 
-  // Group by league
   const leagueGroups: { [key: number]: EnhancedPrediction[] } = {};
   for (const p of predictions) {
     const lid = p.matchInfo.leagueId;
@@ -277,148 +284,54 @@ async function addOdds(predictions: EnhancedPrediction[]): Promise<EnhancedPredi
     leagueGroups[lid].push(p);
   }
 
-  // Debug: Log all league IDs found
-  console.log('[Odds] League IDs found:', Object.keys(leagueGroups));
-
-  // Fetch odds for each league
   for (const leagueId of Object.keys(leagueGroups).map(Number)) {
     const sportKey = LEAGUE_TO_SPORT_KEY[leagueId];
-    
-    if (!sportKey) {
-      console.log(`[Odds] No sport key mapping for league ID: ${leagueId}`);
-      continue;
-    }
-    
-    console.log(`[Odds] Fetching for league ${leagueId} -> ${sportKey}`);
+    if (!sportKey) continue;
 
     try {
       const oddsArray = await getBatchOddsAsArray(sportKey);
-      
-      // Log available matches for debugging
-      if (oddsArray.length > 0) {
-        console.log(`[Odds] Available matches for ${sportKey}:`);
-        oddsArray.forEach(o => console.log(`  - ${o.homeTeam} vs ${o.awayTeam}`));
-      } else {
-        console.log(`[Odds] No matches found for ${sportKey}`);
-      }
-      
       const preds = leagueGroups[leagueId];
 
       for (const pred of preds) {
-        const odds = findOddsForTeams(
-          oddsArray,
-          pred.matchInfo.homeTeam,
-          pred.matchInfo.awayTeam
-        );
+        const odds = findOddsForTeams(oddsArray, pred.matchInfo.homeTeam, pred.matchInfo.awayTeam);
+        if (!odds) continue;
 
-        if (odds) {
-          console.log(`[Odds] Found odds for ${pred.matchInfo.homeTeam} vs ${pred.matchInfo.awayTeam}`);
-          
-          // Match market to odds
-          if (pred.market.includes('OVER') && pred.market.includes('2_5') && odds.over) {
-            const impliedProb = 1 / odds.over.odds;
-            const calculatedEdge = (pred.probability - impliedProb) * 100;
-            
-            console.log(`[Odds] Over 2.5: Our prob=${(pred.probability * 100).toFixed(1)}%, Book implied=${(impliedProb * 100).toFixed(1)}%, Edge=${calculatedEdge.toFixed(1)}%`);
-            
-            pred.oddsComparison = {
-              bookmakerOdds: odds.over.odds,
-              bookmakerLine: odds.over.line,
-              bookmaker: odds.over.bookmaker,
-              edge: Math.round(calculatedEdge * 10) / 10,
-              value: calculatedEdge >= 10 ? 'STRONG' : calculatedEdge >= 5 ? 'GOOD' : calculatedEdge >= 0 ? 'FAIR' : 'POOR',
-            };
-            
-            // Update edge with real calculation
-            pred.edge = Math.round(calculatedEdge * 10) / 10;
-            pred.impliedProbability = impliedProb;
-            pred.bookmakerOdds = odds.over.odds;
-            pred.bookmaker = odds.over.bookmaker;
-            
-          } else if (pred.market.includes('UNDER') && pred.market.includes('2_5') && odds.under) {
-            const impliedProb = 1 / odds.under.odds;
-            const calculatedEdge = (pred.probability - impliedProb) * 100;
-            
-            pred.oddsComparison = {
-              bookmakerOdds: odds.under.odds,
-              bookmakerLine: odds.under.line,
-              bookmaker: odds.under.bookmaker,
-              edge: Math.round(calculatedEdge * 10) / 10,
-              value: calculatedEdge >= 10 ? 'STRONG' : calculatedEdge >= 5 ? 'GOOD' : calculatedEdge >= 0 ? 'FAIR' : 'POOR',
-            };
-            
-            pred.edge = Math.round(calculatedEdge * 10) / 10;
-            pred.impliedProbability = impliedProb;
-            pred.bookmakerOdds = odds.under.odds;
-            pred.bookmaker = odds.under.bookmaker;
-          }
-          
-          // Match Winner - Home
-          else if (pred.market === 'MATCH_WINNER_HOME' && odds.homeWin) {
-            const impliedProb = 1 / odds.homeWin.odds;
-            const calculatedEdge = (pred.probability - impliedProb) * 100;
-            
-            console.log(`[Odds] Home Win: Our prob=${(pred.probability * 100).toFixed(1)}%, Book implied=${(impliedProb * 100).toFixed(1)}%, Edge=${calculatedEdge.toFixed(1)}%`);
-            
-            pred.oddsComparison = {
-              bookmakerOdds: odds.homeWin.odds,
-              bookmaker: odds.homeWin.bookmaker,
-              edge: Math.round(calculatedEdge * 10) / 10,
-              value: calculatedEdge >= 10 ? 'STRONG' : calculatedEdge >= 5 ? 'GOOD' : calculatedEdge >= 0 ? 'FAIR' : 'POOR',
-            };
-            
-            pred.edge = Math.round(calculatedEdge * 10) / 10;
-            pred.impliedProbability = impliedProb;
-            pred.bookmakerOdds = odds.homeWin.odds;
-            pred.bookmaker = odds.homeWin.bookmaker;
-          }
-          
-          // Match Winner - Away
-          else if (pred.market === 'MATCH_WINNER_AWAY' && odds.awayWin) {
-            const impliedProb = 1 / odds.awayWin.odds;
-            const calculatedEdge = (pred.probability - impliedProb) * 100;
-            
-            console.log(`[Odds] Away Win: Our prob=${(pred.probability * 100).toFixed(1)}%, Book implied=${(impliedProb * 100).toFixed(1)}%, Edge=${calculatedEdge.toFixed(1)}%`);
-            
-            pred.oddsComparison = {
-              bookmakerOdds: odds.awayWin.odds,
-              bookmaker: odds.awayWin.bookmaker,
-              edge: Math.round(calculatedEdge * 10) / 10,
-              value: calculatedEdge >= 10 ? 'STRONG' : calculatedEdge >= 5 ? 'GOOD' : calculatedEdge >= 0 ? 'FAIR' : 'POOR',
-            };
-            
-            pred.edge = Math.round(calculatedEdge * 10) / 10;
-            pred.impliedProbability = impliedProb;
-            pred.bookmakerOdds = odds.awayWin.odds;
-            pred.bookmaker = odds.awayWin.bookmaker;
-          }
-          
-          // Double Chance 1X (Home or Draw)
-          else if (pred.market === 'DOUBLE_CHANCE_1X' && odds.homeWin && odds.draw) {
-            // Double chance implied = homeWin implied + draw implied (approximate)
-            const homeImplied = 1 / odds.homeWin.odds;
-            const drawImplied = 1 / odds.draw.odds;
-            // Note: This is an approximation - real DC odds would be different
-            const dcImplied = Math.min(0.90, homeImplied + drawImplied);
-            const calculatedEdge = (pred.probability - dcImplied) * 100;
-            
-            console.log(`[Odds] DC 1X: Our prob=${(pred.probability * 100).toFixed(1)}%, Book implied=${(dcImplied * 100).toFixed(1)}%, Edge=${calculatedEdge.toFixed(1)}%`);
-            
-            pred.oddsComparison = {
-              bookmakerOdds: 1 / dcImplied, // Convert back to odds
-              bookmaker: odds.homeWin.bookmaker,
-              edge: Math.round(calculatedEdge * 10) / 10,
-              value: calculatedEdge >= 10 ? 'STRONG' : calculatedEdge >= 5 ? 'GOOD' : calculatedEdge >= 0 ? 'FAIR' : 'POOR',
-            };
-            
-            pred.edge = Math.round(calculatedEdge * 10) / 10;
-            pred.impliedProbability = dcImplied;
-            pred.bookmakerOdds = 1 / dcImplied;
-            pred.bookmaker = odds.homeWin.bookmaker;
-          }
-          // Note: BTTS not available from The Odds API - will show Edge 0%
-        } else {
-          console.log(`[Odds] No match found for ${pred.matchInfo.homeTeam} vs ${pred.matchInfo.awayTeam}`);
+        let bookOdds: number | null = null;
+        let bookmaker = '';
+
+        if (pred.market.includes('OVER') && pred.market.includes('2_5') && odds.over) {
+          bookOdds = odds.over.odds;
+          bookmaker = odds.over.bookmaker;
+        } else if (pred.market.includes('UNDER') && pred.market.includes('2_5') && odds.under) {
+          bookOdds = odds.under.odds;
+          bookmaker = odds.under.bookmaker;
+        } else if (pred.market === 'MATCH_WINNER_HOME' && odds.homeWin) {
+          bookOdds = odds.homeWin.odds;
+          bookmaker = odds.homeWin.bookmaker;
+        } else if (pred.market === 'MATCH_WINNER_AWAY' && odds.awayWin) {
+          bookOdds = odds.awayWin.odds;
+          bookmaker = odds.awayWin.bookmaker;
+        } else if (pred.market === 'DOUBLE_CHANCE_1X' && odds.homeWin && odds.draw) {
+          const dcImplied = Math.min(0.90, 1 / odds.homeWin.odds + 1 / odds.draw.odds);
+          bookOdds = 1 / dcImplied;
+          bookmaker = odds.homeWin.bookmaker;
+        }
+
+        if (bookOdds && bookOdds > 1) {
+          const impliedProb = 1 / bookOdds;
+          const calculatedEdge = (pred.probability - impliedProb) * 100;
+
+          pred.bookmakerOdds = bookOdds;
+          pred.bookmaker = bookmaker;
+          pred.impliedProbability = impliedProb;
+          pred.edge = Math.round(calculatedEdge * 10) / 10;
+
+          pred.oddsComparison = {
+            bookmakerOdds: bookOdds,
+            bookmaker,
+            edge: pred.edge,
+            value: calculatedEdge >= 10 ? 'STRONG' : calculatedEdge >= 5 ? 'GOOD' : calculatedEdge >= 0 ? 'FAIR' : 'POOR',
+          };
         }
       }
     } catch (e) {
@@ -429,27 +342,15 @@ async function addOdds(predictions: EnhancedPrediction[]): Promise<EnhancedPredi
   return predictions;
 }
 
-// ============== FILTER NO-BET PREDICTIONS ==============
+// ============== FILTER & CATEGORIZE ==============
 
 function filterNoBets(predictions: EnhancedPrediction[]): EnhancedPrediction[] {
   return predictions.filter(p => {
-    // Require positive edge when bookmaker odds available
-    if (p.bookmakerOdds && p.edge < -3) {
-      console.log(`[Filter] Removing ${p.pick} - negative edge: ${p.edge}%`);
-      return false;
-    }
-    
-    // Minimum confidence threshold
-    if (p.confidence < 35) {
-      console.log(`[Filter] Removing ${p.pick} - low confidence: ${p.confidence}%`);
-      return false;
-    }
-    
+    if (p.bookmakerOdds && p.edge < -3) return false;
+    if (p.confidence < 35) return false;
     return true;
   });
 }
-
-// ============== ASSIGN CATEGORIES (Works with or without odds) ==============
 
 function assignCategories(predictions: EnhancedPrediction[]): EnhancedPrediction[] {
   return predictions.map(p => {
@@ -457,67 +358,42 @@ function assignCategories(predictions: EnhancedPrediction[]): EnhancedPrediction
     const isCorners = p.market.includes('CORNER');
     const prob = p.probability > 1 ? p.probability / 100 : p.probability;
     const probPercent = prob * 100;
-    
+
     let category: string;
-    
+
     if (hasOdds) {
-      // WITH ODDS: Use edge for category
-      if (p.edge >= 6 && p.confidence >= 58) {
-        category = 'LOW_RISK';
-      } else if (p.edge >= 3 && p.confidence >= 52) {
-        category = 'VALUE';
-      } else if (p.edge >= 0) {
-        category = 'SPECULATIVE';
-      } else {
-        category = 'NO_BET';
-      }
+      if (p.edge >= 6 && p.confidence >= 58) category = 'LOW_RISK';
+      else if (p.edge >= 3 && p.confidence >= 52) category = 'VALUE';
+      else if (p.edge >= 0) category = 'SPECULATIVE';
+      else category = 'NO_BET';
     } else {
-      // WITHOUT ODDS: Use confidence + probability for category
-      // Corners will always fall here - be more generous
-      if (isCorners) {
-        // CORNERS: No odds available from The Odds API
-        if (p.confidence >= 65 && probPercent >= 55) {
-          category = 'LOW_RISK';
-        } else if (p.confidence >= 58 && probPercent >= 48) {
-          category = 'VALUE';
-        } else {
-          category = 'SPECULATIVE';
-        }
-        // Don't warn about no odds for corners - it's expected
-      } else {
-        // GOALS without odds (unusual)
-        if (p.confidence >= 65 && probPercent >= 55) {
-          category = 'LOW_RISK';
-        } else if (p.confidence >= 58 && probPercent >= 48) {
-          category = 'VALUE';
-        } else {
-          category = 'SPECULATIVE';
-        }
-        // Add warning only for non-corner markets
-        if (!p.warnings.includes('No bookmaker odds available')) {
-          p.warnings.push('No bookmaker odds available - edge not calculated');
-        }
+      if (p.confidence >= 65 && probPercent >= 55) category = 'LOW_RISK';
+      else if (p.confidence >= 58 && probPercent >= 48) category = 'VALUE';
+      else category = 'SPECULATIVE';
+
+      if (!isCorners && !p.warnings.includes('No bookmaker odds available')) {
+        p.warnings.push('No bookmaker odds available - edge not calculated');
       }
     }
-    
+
     return { ...p, category };
   });
 }
 
-// ============== SAVE TO DATABASE ==============
+// ============== SAVE TO PREDICTIONS TABLE ==============
 
-async function saveToDb(predictions: EnhancedPrediction[]): Promise<void> {
-  if (!saveAnalysisBatch) return;
+async function saveToPredictionsTable(predictions: EnhancedPrediction[]): Promise<void> {
+  if (!supabase || !isSupabaseConfigured || !isSupabaseConfigured()) return;
 
   try {
-    const records: AnalysisRecord[] = predictions.map((p) => ({
+    const records = predictions.map(p => ({
       home_team: p.matchInfo.homeTeam,
       away_team: p.matchInfo.awayTeam,
       market: p.market,
       selection: p.pick,
       line: null,
       odds: p.bookmakerOdds || 0,
-      probability: Math.round(p.probability * 100),
+      probability: Math.round((p.probability > 1 ? p.probability : p.probability * 100)),
       confidence: p.confidence,
       expected_value: p.edge,
       verdict: p.aiInsight || null,
@@ -526,16 +402,63 @@ async function saveToDb(predictions: EnhancedPrediction[]): Promise<void> {
         ? new Date(p.matchInfo.kickoff).toISOString().split('T')[0]
         : null,
     }));
-    await saveAnalysisBatch(records);
-    console.log(`[DB] Saved ${predictions.length} football predictions`);
+
+    // Use predictions table (not analysis_history)
+    const { error } = await supabase.from('predictions').insert(records);
+    if (error) {
+      console.error('[DB] Predictions insert error:', error);
+      // Fallback to analysis_history
+      if (saveAnalysisBatch) await saveAnalysisBatch(records);
+    } else {
+      console.log(`[DB] Saved ${records.length} football predictions to predictions table`);
+    }
   } catch (e) {
     console.error('[DB] Save error:', e);
+    // Fallback
+    if (saveAnalysisBatch) {
+      try {
+        const records = predictions.map(p => ({
+          home_team: p.matchInfo.homeTeam,
+          away_team: p.matchInfo.awayTeam,
+          market: p.market,
+          selection: p.pick,
+          line: null,
+          odds: p.bookmakerOdds || 0,
+          probability: Math.round((p.probability > 1 ? p.probability : p.probability * 100)),
+          confidence: p.confidence,
+          expected_value: p.edge,
+          verdict: p.aiInsight || null,
+          data_quality: p.dataQuality,
+          match_date: p.matchInfo.kickoff
+            ? new Date(p.matchInfo.kickoff).toISOString().split('T')[0]
+            : null,
+        }));
+        await saveAnalysisBatch(records);
+      } catch {}
+    }
   }
 }
 
 // ============== MAIN API HANDLER ==============
 
 export async function GET() {
+  // Prevent double execution (React Strict Mode in dev)
+  if (isRunning) {
+    // Return cached if available, otherwise wait
+    if (cachedPredictions && Date.now() - cacheTime < CACHE_DURATION) {
+      return NextResponse.json({
+        success: true,
+        predictions: cachedPredictions,
+        cached: true,
+        evaluation: cachedEvalResult ? serializeEvalResult(cachedEvalResult) : null,
+        aiEnhanced: cachedPredictions.some(p => p.aiEnhanced),
+        hasOdds: cachedPredictions.some(p => p.bookmakerOdds),
+        analyzedAt: new Date(cacheTime).toISOString(),
+      });
+    }
+    return NextResponse.json({ success: true, predictions: [], message: 'Analysis in progress' });
+  }
+
   try {
     // Check cache
     if (cachedPredictions && Date.now() - cacheTime < CACHE_DURATION) {
@@ -543,12 +466,42 @@ export async function GET() {
         success: true,
         predictions: cachedPredictions,
         cached: true,
-        aiEnhanced: cachedPredictions.some((p) => p.aiEnhanced),
-        hasOdds: cachedPredictions.some((p) => p.bookmakerOdds),
+        evaluation: cachedEvalResult ? serializeEvalResult(cachedEvalResult) : null,
+        aiEnhanced: cachedPredictions.some(p => p.aiEnhanced),
+        hasOdds: cachedPredictions.some(p => p.bookmakerOdds),
         analyzedAt: new Date(cacheTime).toISOString(),
+        stats: computeStats(cachedPredictions),
       });
     }
 
+    isRunning = true;
+
+    // === STEP 1: Run background evaluation (non-blocking but we await for calibration) ===
+    console.log('[Football] Running background evaluation...');
+    let evalResult: BackgroundEvalResult;
+    try {
+      evalResult = await runBackgroundEvaluation('FOOTBALL');
+    } catch (e) {
+      console.error('[Football] Background eval failed:', e);
+      evalResult = {
+        performance: null,
+        calibration: null,
+        newlyEvaluated: 0,
+        success: false,
+        error: String(e),
+        recentResults: [],
+      };
+    }
+
+    // Get calibration profile (may be null if not enough data)
+    const calibration = evalResult.calibration;
+    if (calibration?.isReliable) {
+      console.log(`[Football] Calibration active: overall bias ${calibration.overallBias}%, correction ${calibration.overallCorrection}`);
+    } else {
+      console.log(`[Football] Calibration not yet reliable (${calibration?.sampleSize || 0} samples)`);
+    }
+
+    // === STEP 2: Fetch fixtures ===
     console.log('[Football] Fetching fixtures...');
     if (trackApiUsage) await trackApiUsage('api_sports', '/fixtures');
 
@@ -561,96 +514,110 @@ export async function GET() {
     console.log(`[Football] Found ${allFixtures.length} fixtures`);
 
     if (allFixtures.length === 0) {
+      isRunning = false;
       return NextResponse.json({
         success: true,
         predictions: [],
+        evaluation: serializeEvalResult(evalResult),
         message: 'No fixtures found',
       });
     }
 
-    // Analyze fixtures (uses new fixed analysis)
+    // === STEP 3: Analyze fixtures (with calibration applied) ===
     console.log('[Football] Analyzing...');
     const suggestions: FootballSuggestion[] = [];
     const fixturesToAnalyze = allFixtures.slice(0, 25);
-    
+
     for (const fixture of fixturesToAnalyze) {
       const analysis = await analyzeFootballMatch(fixture);
       suggestions.push(...analysis);
     }
 
-    // Convert to API format
-    let predictions = suggestions.map(convertToApiFormat);
-    
-    // Sort by category first, then confidence
+    // Convert with calibration applied
+    let predictions = suggestions.map(s => convertToApiFormat(s, calibration));
+
+    // Sort
     predictions.sort((a, b) => {
       const catOrder: Record<string, number> = { LOW_RISK: 0, VALUE: 1, SPECULATIVE: 2, NO_BET: 3 };
-      if (catOrder[a.category] !== catOrder[b.category]) {
-        return catOrder[a.category] - catOrder[b.category];
-      }
-      return b.confidence - a.confidence;
+      return (catOrder[a.category] || 3) - (catOrder[b.category] || 3) || b.confidence - a.confidence;
     });
 
-    // Limit before AI enhancement
     predictions = predictions.slice(0, 50);
 
-    // Add bookmaker odds & recalculate edge
+    // === STEP 4: Add bookmaker odds ===
     console.log('[Football] Fetching odds...');
     predictions = await addOdds(predictions);
 
-    // Assign categories (works with or without odds)
-    predictions = assignCategories(predictions);
+    // Recalculate edge with calibrated probabilities
+    for (const pred of predictions) {
+      if (pred.bookmakerOdds && pred.bookmakerOdds > 1) {
+        const impliedProb = 1 / pred.bookmakerOdds;
+        pred.edge = Math.round((pred.probability - impliedProb) * 1000) / 10;
+      }
+    }
 
-    // Filter out NO BET predictions
+    // === STEP 5: Categorize & filter ===
+    predictions = assignCategories(predictions);
     predictions = filterNoBets(predictions);
 
-    // Re-sort after category assignment
     predictions.sort((a, b) => {
       const catOrder: Record<string, number> = { LOW_RISK: 0, VALUE: 1, SPECULATIVE: 2, NO_BET: 3 };
-      if (catOrder[a.category] !== catOrder[b.category]) {
-        return catOrder[a.category] - catOrder[b.category];
-      }
-      return b.confidence - a.confidence;
+      return (catOrder[a.category] || 3) - (catOrder[b.category] || 3) || b.confidence - a.confidence;
     });
 
-    // AI enhancement (insight only, no number changes)
+    // === STEP 6: AI enhancement ===
     console.log('[Football] AI enhancement...');
     predictions = await enhanceWithAI(predictions);
 
-    // Save to DB (async, don't wait)
-    saveToDb(predictions).catch(() => {});
+    // === STEP 7: Save to DB ===
+    saveToPredictionsTable(predictions).catch(() => {});
 
-    // Cache results
+    // Cache
     cachedPredictions = predictions;
+    cachedEvalResult = evalResult;
     cacheTime = Date.now();
+    isRunning = false;
+
+    const calibrationCount = predictions.filter(p => p.calibrationApplied).length;
+    if (calibrationCount > 0) {
+      console.log(`[Football] Calibration applied to ${calibrationCount}/${predictions.length} predictions`);
+    }
 
     return NextResponse.json({
       success: true,
       predictions,
       fixtureCount: allFixtures.length,
-      aiEnhanced: predictions.some((p) => p.aiEnhanced),
-      hasOdds: predictions.some((p) => p.bookmakerOdds),
+      aiEnhanced: predictions.some(p => p.aiEnhanced),
+      hasOdds: predictions.some(p => p.bookmakerOdds),
       analyzedAt: new Date().toISOString(),
-      // New metadata
-      stats: {
-        total: predictions.length,
-        lowRisk: predictions.filter(p => p.category === 'LOW_RISK').length,
-        value: predictions.filter(p => p.category === 'VALUE').length,
-        speculative: predictions.filter(p => p.category === 'SPECULATIVE').length,
-        avgConfidence: predictions.length > 0 
-          ? Math.round(predictions.reduce((a, p) => a + p.confidence, 0) / predictions.length)
-          : 0,
-        avgEdge: predictions.length > 0
-          ? Math.round(predictions.reduce((a, p) => a + p.edge, 0) / predictions.length * 10) / 10
-          : 0,
-      }
+      // NEW: Evaluation data for the frontend
+      evaluation: serializeEvalResult(evalResult),
+      stats: computeStats(predictions),
     });
   } catch (error) {
+    isRunning = false;
     console.error('[Football] Error:', error);
     return NextResponse.json(
       { success: false, error: 'Analysis failed', predictions: [] },
       { status: 500 }
     );
   }
+}
+
+function computeStats(predictions: EnhancedPrediction[]) {
+  return {
+    total: predictions.length,
+    lowRisk: predictions.filter(p => p.category === 'LOW_RISK').length,
+    value: predictions.filter(p => p.category === 'VALUE').length,
+    speculative: predictions.filter(p => p.category === 'SPECULATIVE').length,
+    avgConfidence: predictions.length > 0
+      ? Math.round(predictions.reduce((a, p) => a + p.confidence, 0) / predictions.length)
+      : 0,
+    avgEdge: predictions.length > 0
+      ? Math.round(predictions.reduce((a, p) => a + p.edge, 0) / predictions.length * 10) / 10
+      : 0,
+    calibrated: predictions.filter(p => p.calibrationApplied).length,
+  };
 }
 
 export const dynamic = 'force-dynamic';

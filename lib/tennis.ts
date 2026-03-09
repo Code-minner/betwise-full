@@ -1,14 +1,7 @@
 /**
- * Tennis API - v10 (FIXED)
+ * Tennis API - v14 (FIXED: replaced broken RapidAPI /tournaments/get-next-matches
+ *                   with direct SofaScore public API - no key required)
  * File: lib/tennis.ts
- * 
- * CRITICAL FIXES:
- * ✅ SofaScore API for REAL fixtures (replaces dead v1.tennis.api-sports.io)
- * ✅ SofaScore player statistics (replaces hardcoded win rates/form)
- * ✅ Dynamic odds sport key discovery via /v4/sports
- * ✅ Kept tier system as fallback, but live data takes priority
- * ✅ Player name normalization with accent handling
- * ✅ Better sample fixtures removed - no more fake predictions
  */
 
 const SPORTS_API_KEY = process.env.SPORTS_API_KEY || '';
@@ -80,10 +73,9 @@ export interface TennisSuggestion {
 }
 
 // ============== PLAYER TIER SYSTEM (FALLBACK) ==============
-// This is used when SofaScore data is unavailable
 
 const PLAYER_TIERS: Record<string, 'ELITE' | 'TOP10' | 'TOP20' | 'TOP30' | 'TOP50' | 'TOP100' | 'OUTSIDE'> = {
-  // ATP ELITE
+  // ATP ELITE (top 3)
   'Jannik Sinner': 'ELITE',
   'Alexander Zverev': 'ELITE',
   'Carlos Alcaraz': 'ELITE',
@@ -93,18 +85,34 @@ const PLAYER_TIERS: Record<string, 'ELITE' | 'TOP10' | 'TOP20' | 'TOP30' | 'TOP5
   'Casper Ruud': 'TOP10',
   'Novak Djokovic': 'TOP10',
   'Alex de Minaur': 'TOP10',
+  'Alex De Minaur': 'TOP10',
   'Andrey Rublev': 'TOP10',
   'Grigor Dimitrov': 'TOP10',
+  'Jack Draper': 'TOP10',
   // ATP TOP 20
   'Tommy Paul': 'TOP20',
   'Stefanos Tsitsipas': 'TOP20',
   'Holger Rune': 'TOP20',
-  'Jack Draper': 'TOP20',
   'Hubert Hurkacz': 'TOP20',
   'Frances Tiafoe': 'TOP20',
   'Lorenzo Musetti': 'TOP20',
   'Ben Shelton': 'TOP20',
-  // WTA ELITE
+  'Arthur Fils': 'TOP20',
+  'Felix Auger-Aliassime': 'TOP20',
+  'Ugo Humbert': 'TOP20',
+  'Francisco Cerundolo': 'TOP20',
+  'Alex Michelsen': 'TOP20',
+  // ATP TOP 30
+  'Joao Fonseca': 'TOP30',
+  'Learner Tien': 'TOP30',
+  'Sebastian Baez': 'TOP30',
+  'Alejandro Davidovich Fokina': 'TOP30',
+  'Alexander Bublik': 'TOP30',
+  'Valentin Vacherot': 'TOP50',
+  'Cameron Norrie': 'TOP50',
+  'Rinky Hijikata': 'TOP50',
+  'Arthur Rinderknech': 'TOP50',
+  // WTA ELITE (top 3)
   'Aryna Sabalenka': 'ELITE',
   'Iga Swiatek': 'ELITE',
   'Coco Gauff': 'ELITE',
@@ -116,107 +124,202 @@ const PLAYER_TIERS: Record<string, 'ELITE' | 'TOP10' | 'TOP20' | 'TOP30' | 'TOP5
   'Emma Navarro': 'TOP10',
   'Daria Kasatkina': 'TOP10',
   'Madison Keys': 'TOP10',
+  'Paula Badosa': 'TOP10',
+  // WTA TOP 20
+  'Mirra Andreeva': 'TOP20',
+  'Donna Vekic': 'TOP20',
+  'Elina Svitolina': 'TOP20',
+  'Beatriz Haddad Maia': 'TOP20',
+  'Karolina Muchova': 'TOP20',
+  'Naomi Osaka': 'TOP20',
+  'Maria Sakkari': 'TOP20',
+  'Belinda Bencic': 'TOP20',
+  'Katerina Siniakova': 'TOP20',
+  // WTA TOP 30
+  'Elise Mertens': 'TOP30',
+  'Marta Kostyuk': 'TOP30',
+  'Linda Noskova': 'TOP30',
+  'Anna Blinkova': 'TOP30',
+  'Bianca Andreescu': 'TOP30',
+  'Lulu Sun': 'TOP30',
+  'Ashlyn Krueger': 'TOP50',
+  'Amanda Anisimova': 'TOP50',
+  'Sonay Kartal': 'TOP50',
+  'Kamilla Rakhimova': 'TOP50',
 };
 
-// ============== SOFASCORE FIXTURES (REPLACES DEAD API) ==============
+// ============== ESPN FREE PUBLIC API ==============
+// No API key, no bot detection, returns ATP + WTA scoreboard data.
 
-const SOFASCORE_HOST = 'sofascore.p.rapidapi.com';
+// === Caches ===
+let allFixturesCache: TennisFixture[] | null = null;
+let allFixturesCacheTime = 0;
+const ALL_FIXTURES_CACHE_TTL = 20 * 60 * 1000; // 20 minutes
 
-async function fetchSofaScore<T>(endpoint: string): Promise<T | null> {
-  if (!RAPIDAPI_KEY) {
-    console.log('[SofaScore] No RapidAPI key configured');
-    return null;
-  }
+// === Fetch mutex ===
+let fetchInProgress: Promise<TennisFixture[]> | null = null;
 
+async function fetchESPNTennis(league: 'atp' | 'wta'): Promise<TennisFixture[]> {
   try {
-    console.log(`[SofaScore] Fetching: ${endpoint}`);
-    const res = await fetch(`https://${SOFASCORE_HOST}${endpoint}`, {
-      headers: {
-        'x-rapidapi-key': RAPIDAPI_KEY,
-        'x-rapidapi-host': SOFASCORE_HOST,
-      },
-      next: { revalidate: 1800 }, // 30 min cache
-    });
+    const url = `https://site.api.espn.com/apis/site/v2/sports/tennis/${league}/scoreboard`;
+    console.log(`[ESPN] GET /tennis/${league}/scoreboard`);
+    const res = await fetch(url);
+    if (!res.ok) { console.log(`[ESPN] HTTP ${res.status} for ${league}`); return []; }
+    const data = await res.json();
 
-    if (!res.ok) {
-      console.error(`[SofaScore] HTTP ${res.status} for ${endpoint}`);
-      return null;
+    const rawEvents: any[] = data?.events || [];
+    console.log(`[ESPN] ${league.toUpperCase()}: ${rawEvents.length} tournaments`);
+
+    const fixtures: TennisFixture[] = [];
+
+    for (const tournament of rawEvents) {
+      const tournamentName = tournament.name || `${league.toUpperCase()} Tour`;
+      // Matches live in tournament.groupings[].competitions[]
+      const groupings: any[] = tournament.groupings || [];
+
+      for (const g of groupings) {
+        const groupName = g.grouping?.displayName || g.grouping?.slug || '';
+        // Skip doubles groupings
+        if (groupName.toLowerCase().includes('doubles')) continue;
+
+        const competitions: any[] = g.competitions || [];
+        console.log(`[ESPN] "${tournamentName}" / "${groupName}": ${competitions.length} matches`);
+
+        for (const match of competitions) {
+          const competitors: any[] = match.competitors || [];
+          if (competitors.length < 2) continue;
+
+          const statusState = match.status?.type?.state || '';
+          const statusName = match.status?.type?.name || '';
+          if (statusState === 'post') continue; // finished
+
+          const p1 = competitors[0];
+          const p2 = competitors[1];
+          const p1Name = p1?.athlete?.displayName || p1?.athlete?.fullName || p1?.displayName || 'Player 1';
+          const p2Name = p2?.athlete?.displayName || p2?.athlete?.fullName || p2?.displayName || 'Player 2';
+
+          // Skip TBD matches - no useful data
+          if (p1Name === 'TBD' || p2Name === 'TBD' || p1Name === 'Player 1' || p2Name === 'Player 2') continue;
+
+          console.log(`[ESPN] MATCH: ${p1Name} vs ${p2Name} (${statusState})`);
+
+          fixtures.push({
+            id: `tn-espn-${match.id}`,
+            externalId: parseInt(match.id) || 0,
+            tournament: {
+              id: parseInt(tournament.id) || 0,
+              name: tournamentName,
+              category: detectCategory(tournamentName),
+              surface: detectSurface(tournamentName),
+            },
+            player1: {
+              id: parseInt(p1?.athlete?.id || p1?.id || '0') || 0,
+              name: p1Name,
+              country: p1?.athlete?.flag?.alt || p1?.athlete?.country?.abbreviation || '',
+              ranking: p1?.curatedRank?.current || p1?.rank || undefined,
+            },
+            player2: {
+              id: parseInt(p2?.athlete?.id || p2?.id || '0') || 0,
+              name: p2Name,
+              country: p2?.athlete?.flag?.alt || p2?.athlete?.country?.abbreviation || '',
+              ranking: p2?.curatedRank?.current || p2?.rank || undefined,
+            },
+            startTime: new Date(match.date || tournament.date || Date.now()),
+            round: match.notes?.[0]?.headline || match.shortName || g.grouping?.displayName || 'Round',
+            status: statusState === 'in' ? 'inprogress' : 'notstarted',
+          });
+        }
+      }
     }
 
-    return await res.json();
+    return fixtures;
   } catch (e) {
-    console.error('[SofaScore] Fetch error:', e);
-    return null;
+    console.error(`[ESPN] Error fetching ${league}:`, e);
+    return [];
   }
 }
 
-// ============== FIXTURES ==============
+
+async function fetchAllUpcomingFixtures(): Promise<TennisFixture[]> {
+  if (allFixturesCache && Date.now() - allFixturesCacheTime < ALL_FIXTURES_CACHE_TTL) {
+    console.log(`[Tennis] Using cached fixtures (${allFixturesCache.length})`);
+    return allFixturesCache;
+  }
+  if (fetchInProgress) {
+    console.log('[Tennis] Waiting for in-progress fetch...');
+    return fetchInProgress;
+  }
+  fetchInProgress = doFetchAllFixtures();
+  try { return await fetchInProgress; } finally { fetchInProgress = null; }
+}
+
+async function doFetchAllFixtures(): Promise<TennisFixture[]> {
+  const [atpFixtures, wtaFixtures] = await Promise.all([
+    fetchESPNTennis('atp'),
+    fetchESPNTennis('wta'),
+  ]);
+  let fixtures = [...atpFixtures, ...wtaFixtures];
+  const seen = new Set<string>();
+  fixtures = fixtures.filter(f => { if (seen.has(f.id)) return false; seen.add(f.id); return true; });
+  fixtures.sort((a, b) => a.startTime.getTime() - b.startTime.getTime());
+  console.log(`[ESPN] ${fixtures.length} total singles fixtures`);
+
+  if (fixtures.length === 0) {
+    console.log('[Tennis] ESPN returned nothing, trying API-Sports...');
+    const todayStr = new Date().toISOString().split('T')[0];
+    const tomorrow = new Date(Date.now() + 86400000).toISOString().split('T')[0];
+    const dayAfter = new Date(Date.now() + 172800000).toISOString().split('T')[0];
+    const [f1, f2, f3] = await Promise.all([
+      getFixturesFromApiSports(todayStr),
+      getFixturesFromApiSports(tomorrow),
+      getFixturesFromApiSports(dayAfter),
+    ]);
+    fixtures = [...f1, ...f2, ...f3];
+  }
+
+  console.log(`[Tennis] Total fixtures: ${fixtures.length}`);
+  allFixturesCache = fixtures;
+  allFixturesCacheTime = Date.now();
+  return fixtures;
+}
+
+// ============== PUBLIC FIXTURE GETTERS ==============
 
 export async function getTodaysFixtures(): Promise<TennisFixture[]> {
-  return getFixturesByDate(new Date().toISOString().split('T')[0]);
+  const all = await fetchAllUpcomingFixtures();
+  const today = new Date().toISOString().split('T')[0];
+  return all.filter(f => f.startTime.toISOString().split('T')[0] === today);
 }
 
 export async function getTomorrowsFixtures(): Promise<TennisFixture[]> {
+  const all = await fetchAllUpcomingFixtures();
   const d = new Date();
   d.setDate(d.getDate() + 1);
-  return getFixturesByDate(d.toISOString().split('T')[0]);
+  const tomorrow = d.toISOString().split('T')[0];
+  return all.filter(f => f.startTime.toISOString().split('T')[0] === tomorrow);
 }
 
 export async function getDayAfterTomorrowFixtures(): Promise<TennisFixture[]> {
+  const all = await fetchAllUpcomingFixtures();
   const d = new Date();
   d.setDate(d.getDate() + 2);
-  return getFixturesByDate(d.toISOString().split('T')[0]);
+  const dayAfter = d.toISOString().split('T')[0];
+  return all.filter(f => f.startTime.toISOString().split('T')[0] === dayAfter);
 }
 
-async function getFixturesByDate(date: string): Promise<TennisFixture[]> {
-  // STRATEGY: Try SofaScore first (reliable), fall back to API-Sports
+// ============== API-SPORTS FALLBACK ==============
 
-  // === 1. Try SofaScore via RapidAPI ===
-  const sofaData = await fetchSofaScore<any>(`/api/v1/sport/tennis/scheduled-events/${date}`);
+async function getFixturesFromApiSports(date: string): Promise<TennisFixture[]> {
+  if (!SPORTS_API_KEY) return [];
+  try {
+    const res = await fetch(`https://v1.tennis.api-sports.io/games?date=${date}`, {
+      headers: { 'x-apisports-key': SPORTS_API_KEY },
+    });
+    if (!res.ok) return [];
+    const json = await res.json();
+    if (json.errors && Object.keys(json.errors).length > 0) return [];
+    const games = json.response || [];
 
-  if (sofaData?.events && sofaData.events.length > 0) {
-    console.log(`[SofaScore] Got ${sofaData.events.length} tennis events for ${date}`);
-
-    return sofaData.events
-      .filter((e: any) => {
-        // Only not-started singles matches
-        const status = e.status?.type;
-        return (status === 'notstarted' || status === 'inprogress') && !e.tournament?.name?.toLowerCase().includes('doubles');
-      })
-      .slice(0, 40)
-      .map((e: any) => ({
-        id: `tn-sofa-${e.id}`,
-        externalId: e.id,
-        tournament: {
-          id: e.tournament?.uniqueTournament?.id || e.tournament?.id || 0,
-          name: e.tournament?.uniqueTournament?.name || e.tournament?.name || 'ATP/WTA Tour',
-          category: detectCategory(e.tournament?.uniqueTournament?.name || e.tournament?.name || ''),
-          surface: detectSurfaceFromSofa(e) || detectSurface(e.tournament?.uniqueTournament?.name || ''),
-        },
-        player1: {
-          id: e.homeTeam?.id || 0,
-          name: e.homeTeam?.name || 'Player 1',
-          country: e.homeTeam?.country?.name || '',
-          ranking: e.homeTeam?.ranking || undefined,
-        },
-        player2: {
-          id: e.awayTeam?.id || 0,
-          name: e.awayTeam?.name || 'Player 2',
-          country: e.awayTeam?.country?.name || '',
-          ranking: e.awayTeam?.ranking || undefined,
-        },
-        startTime: new Date((e.startTimestamp || 0) * 1000),
-        round: e.roundInfo?.name || e.roundInfo?.round?.toString() || 'Round',
-        status: e.status?.type || 'NS',
-      }))
-      .sort((a: TennisFixture, b: TennisFixture) => a.startTime.getTime() - b.startTime.getTime());
-  }
-
-  // === 2. Fallback: API-Sports ===
-  console.log('[SofaScore] No data, trying API-Sports...');
-  const games = await apiCallSports<any[]>(`/games?date=${date}`);
-
-  if (games && games.length > 0) {
     return games
       .filter((g: any) => g.status?.short === 'NS')
       .slice(0, 30)
@@ -244,36 +347,15 @@ async function getFixturesByDate(date: string): Promise<TennisFixture[]> {
         startTime: new Date(g.date),
         round: g.round || 'Round',
         status: g.status?.short || 'NS',
-      }))
-      .sort((a: TennisFixture, b: TennisFixture) => a.startTime.getTime() - b.startTime.getTime());
-  }
-
-  // === 3. NO fallback to fake sample data ===
-  // If both APIs fail, return empty. Don't show fake predictions.
-  console.log(`[Tennis] No fixtures available for ${date} from any source`);
-  return [];
-}
-
-// API-Sports helper (may still work for some users)
-async function apiCallSports<T>(endpoint: string): Promise<T | null> {
-  if (!SPORTS_API_KEY) return null;
-  try {
-    const res = await fetch(`https://v1.tennis.api-sports.io${endpoint}`, {
-      headers: { 'x-apisports-key': SPORTS_API_KEY },
-      next: { revalidate: 3600 },
-    });
-    if (!res.ok) return null;
-    const json = await res.json();
-    if (json.errors && Object.keys(json.errors).length > 0) return null;
-    return json.response;
+      }));
   } catch {
-    return null;
+    return [];
   }
 }
 
 // ============== LIVE PLAYER STATS FROM SOFASCORE ==============
+// Still uses RapidAPI for individual player match history (this endpoint works on Basic)
 
-// Cache to avoid repeated calls for same player in one analysis run
 const playerStatsCache = new Map<string, PlayerStats>();
 
 export async function getPlayerStatsLive(
@@ -289,14 +371,27 @@ export async function getPlayerStatsLive(
   if (!RAPIDAPI_KEY || playerId === 0) return null;
 
   try {
-    // Fetch player's recent matches from SofaScore
-    const lastMatches = await fetchSofaScore<any>(
-      `/api/v1/team/${playerId}/events/last/0`
-    );
+    const url = new URL(`https://sofascore.p.rapidapi.com/teams/get-last-events`);
+    url.searchParams.set('teamId', String(playerId));
+    url.searchParams.set('pageIndex', '0');
 
-    if (!lastMatches?.events || lastMatches.events.length === 0) return null;
+    const res = await fetch(url.toString(), {
+      headers: {
+        'x-rapidapi-key': RAPIDAPI_KEY,
+        'x-rapidapi-host': 'sofascore.p.rapidapi.com',
+      },
+    });
 
-    const recentEvents = lastMatches.events.slice(-10); // last 10 matches
+    if (!res.ok) return null;
+
+    const text = await res.text();
+    if (!text || text.trim().length === 0) return null;
+
+    const lastMatches = JSON.parse(text);
+    const events = lastMatches?.events || lastMatches?.data?.events || (Array.isArray(lastMatches) ? lastMatches : null);
+    if (!events || events.length === 0) return null;
+
+    const recentEvents = events.slice(-10);
     let wins = 0;
     let losses = 0;
     let surfaceWins = 0;
@@ -314,7 +409,6 @@ export async function getPlayerStatsLive(
 
       formArray.push(won ? 'W' : 'L');
 
-      // Check surface match
       const eventSurface = detectSurfaceFromSofa(event) || 'HARD';
       if (eventSurface === surface) {
         surfaceMatches++;
@@ -324,11 +418,7 @@ export async function getPlayerStatsLive(
 
     const totalMatches = wins + losses;
     const winRate = totalMatches > 0 ? wins / totalMatches : 0.5;
-    const surfaceWinRate = surfaceMatches >= 3
-      ? surfaceWins / surfaceMatches
-      : winRate; // Not enough surface data, use overall
-
-    // Determine tier from ranking or fallback
+    const surfaceWinRate = surfaceMatches >= 3 ? surfaceWins / surfaceMatches : winRate;
     const tier = getPlayerTier(playerName);
 
     const stats: PlayerStats = {
@@ -336,7 +426,7 @@ export async function getPlayerStatsLive(
       winRate,
       surfaceWinRate,
       recentForm: formArray.slice(-5).join(''),
-      acesPct: 7, // Default, can be enhanced with more API calls
+      acesPct: 7,
       holdPct: 75,
       tier,
       source: 'LIVE_API',
@@ -351,15 +441,12 @@ export async function getPlayerStatsLive(
 }
 
 // ============== DYNAMIC ODDS SPORT KEYS ==============
-// Instead of hardcoding tournament keys that may not be active,
-// discover what's actually live right now
 
 let activeTennisKeysCache: string[] | null = null;
 let activeTennisKeysCacheTime = 0;
-const KEYS_CACHE_DURATION = 60 * 60 * 1000; // 1 hour
+const KEYS_CACHE_DURATION = 60 * 60 * 1000;
 
 export async function getActiveTennisSportKeys(): Promise<string[]> {
-  // Return cached if fresh
   if (activeTennisKeysCache && Date.now() - activeTennisKeysCacheTime < KEYS_CACHE_DURATION) {
     return activeTennisKeysCache;
   }
@@ -367,14 +454,8 @@ export async function getActiveTennisSportKeys(): Promise<string[]> {
   if (!ODDS_API_KEY) return [];
 
   try {
-    const res = await fetch(
-      `https://api.the-odds-api.com/v4/sports?apiKey=${ODDS_API_KEY}`
-    );
-
-    if (!res.ok) {
-      console.error(`[Odds] Failed to fetch active sports: ${res.status}`);
-      return [];
-    }
+    const res = await fetch(`https://api.the-odds-api.com/v4/sports?apiKey=${ODDS_API_KEY}`);
+    if (!res.ok) return [];
 
     const sports = await res.json();
     const tennisKeys = sports
@@ -382,7 +463,6 @@ export async function getActiveTennisSportKeys(): Promise<string[]> {
       .map((s: any) => s.key);
 
     console.log(`[Odds] Active tennis sport keys: ${tennisKeys.join(', ') || 'NONE'}`);
-
     activeTennisKeysCache = tennisKeys;
     activeTennisKeysCacheTime = Date.now();
     return tennisKeys;
@@ -395,11 +475,12 @@ export async function getActiveTennisSportKeys(): Promise<string[]> {
 // ============== SURFACE DETECTION ==============
 
 function detectSurfaceFromSofa(event: any): string | null {
-  const groundType = event.groundType;
+  const groundType = event.groundType || event.tournament?.uniqueTournament?.groundType;
   if (groundType) {
-    if (groundType.toLowerCase().includes('clay')) return 'CLAY';
-    if (groundType.toLowerCase().includes('grass')) return 'GRASS';
-    if (groundType.toLowerCase().includes('hard') || groundType.toLowerCase().includes('indoor')) return 'HARD';
+    const g = groundType.toLowerCase();
+    if (g.includes('clay')) return 'CLAY';
+    if (g.includes('grass')) return 'GRASS';
+    if (g.includes('hard') || g.includes('indoor')) return 'HARD';
   }
   return null;
 }
@@ -459,19 +540,13 @@ const TOURNAMENT_VARIANCE: Record<string, number> = {
 function getPlayerTier(playerName: string): 'ELITE' | 'TOP10' | 'TOP20' | 'TOP30' | 'TOP50' | 'TOP100' | 'OUTSIDE' {
   if (PLAYER_TIERS[playerName]) return PLAYER_TIERS[playerName];
 
-  // Normalize and try fuzzy match
   const normalized = playerName.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
   for (const [player, tier] of Object.entries(PLAYER_TIERS)) {
     const playerNorm = player.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-    if (normalized.includes(playerNorm) || playerNorm.includes(normalized)) {
-      return tier;
-    }
-    // Last name match
+    if (normalized.includes(playerNorm) || playerNorm.includes(normalized)) return tier;
     const lastName = normalized.split(' ').pop() || '';
     const playerLastName = playerNorm.split(' ').pop() || '';
-    if (lastName.length > 3 && playerLastName === lastName) {
-      return tier;
-    }
+    if (lastName.length > 3 && playerLastName === lastName) return tier;
   }
   return 'OUTSIDE';
 }
@@ -490,14 +565,12 @@ export async function getPlayerStats(
   playerId: number,
   surface: string
 ): Promise<PlayerStats> {
-  // 1. Try live SofaScore data
   const liveStats = await getPlayerStatsLive(playerName, playerId, surface);
   if (liveStats) {
     console.log(`[Stats] Got LIVE data for ${playerName}: WR=${(liveStats.winRate * 100).toFixed(0)}%, Form=${liveStats.recentForm}`);
     return liveStats;
   }
 
-  // 2. Fallback to tier-based estimates
   const tier = getPlayerTier(playerName);
   const tierDefaults: Record<string, { winRate: number; holdPct: number }> = {
     ELITE: { winRate: 0.80, holdPct: 87 },
@@ -510,13 +583,13 @@ export async function getPlayerStats(
   };
 
   const defaults = tierDefaults[tier] || tierDefaults.OUTSIDE;
-
   console.log(`[Stats] Using FALLBACK for ${playerName} (${tier})`);
+
   return {
     ranking: getRankingFallback(playerName),
     winRate: defaults.winRate,
-    surfaceWinRate: defaults.winRate, // No surface data available
-    recentForm: 'WLWLW', // Unknown
+    surfaceWinRate: defaults.winRate,
+    recentForm: 'WLWLW',
     acesPct: 7,
     holdPct: defaults.holdPct,
     tier,
@@ -532,47 +605,30 @@ function calculateMatchProbability(
   surface: string,
   isGrandSlam: boolean
 ): { p1Prob: number; p2Prob: number; modelAgreement: number } {
-  // When we have LIVE data, use actual win rates more heavily
   const hasLiveData = p1Stats.source === 'LIVE_API' && p2Stats.source === 'LIVE_API';
 
   if (hasLiveData) {
-    // === LIVE DATA MODEL ===
-    // Weight actual performance more than tier
-
-    // 1. Base from surface win rate comparison
-    const p1SurfaceStrength = p1Stats.surfaceWinRate;
-    const p2SurfaceStrength = p2Stats.surfaceWinRate;
-
-    // Logistic model: convert win rates to probability
-    const p1LogitStrength = Math.log(p1SurfaceStrength / (1 - p1SurfaceStrength));
-    const p2LogitStrength = Math.log(p2SurfaceStrength / (1 - p2SurfaceStrength));
+    const p1LogitStrength = Math.log(p1Stats.surfaceWinRate / (1 - p1Stats.surfaceWinRate));
+    const p2LogitStrength = Math.log(p2Stats.surfaceWinRate / (1 - p2Stats.surfaceWinRate));
     const logitDiff = p1LogitStrength - p2LogitStrength;
 
-    let p1Prob = 1 / (1 + Math.exp(-logitDiff * 0.7)); // 0.7 dampening factor
+    let p1Prob = 1 / (1 + Math.exp(-logitDiff * 0.7));
 
-    // 2. Form adjustment (recent 5 matches)
     const p1FormScore = p1Stats.recentForm.split('').filter(c => c === 'W').length / Math.max(1, p1Stats.recentForm.length);
     const p2FormScore = p2Stats.recentForm.split('').filter(c => c === 'W').length / Math.max(1, p2Stats.recentForm.length);
     p1Prob += (p1FormScore - p2FormScore) * 0.08;
 
-    // 3. Ranking adjustment (small)
     if (p1Stats.ranking && p2Stats.ranking) {
       const rankDiff = p2Stats.ranking - p1Stats.ranking;
       p1Prob += Math.tanh(rankDiff / 30) * 0.05;
     }
 
-    // 4. Grand Slam bonus (BO5 favors better player)
-    if (isGrandSlam && p1Prob > 0.5) {
-      p1Prob += 0.03;
-    } else if (isGrandSlam && p1Prob < 0.5) {
-      p1Prob -= 0.03;
-    }
+    if (isGrandSlam) p1Prob += p1Prob > 0.5 ? 0.03 : -0.03;
 
     p1Prob = Math.max(0.08, Math.min(0.92, p1Prob));
 
-    // Model agreement: how many factors agree
     const factors = [
-      p1SurfaceStrength > p2SurfaceStrength,
+      p1Stats.surfaceWinRate > p2Stats.surfaceWinRate,
       p1FormScore > p2FormScore,
       (p1Stats.ranking || 999) < (p2Stats.ranking || 999),
     ];
@@ -582,30 +638,23 @@ function calculateMatchProbability(
     return { p1Prob, p2Prob: 1 - p1Prob, modelAgreement };
   }
 
-  // === FALLBACK TIER MODEL (same as before but cleaner) ===
-  const p1Strength = TIER_VALUES[p1Stats.tier];
-  const p2Strength = TIER_VALUES[p2Stats.tier];
-  const strengthDiff = p1Strength - p2Strength;
-
+  // === FALLBACK TIER MODEL ===
+  const strengthDiff = TIER_VALUES[p1Stats.tier] - TIER_VALUES[p2Stats.tier];
   const tierProbs: Record<number, number> = {
     6: 0.93, 5: 0.88, 4: 0.82, 3: 0.75, 2: 0.68, 1: 0.60, 0: 0.50,
     [-1]: 0.40, [-2]: 0.32, [-3]: 0.25, [-4]: 0.18, [-5]: 0.12, [-6]: 0.07,
   };
 
   let p1Prob = tierProbs[Math.max(-6, Math.min(6, strengthDiff))] || 0.50;
-
-  // Small adjustments
   const p1FormScore = p1Stats.recentForm.split('').filter(c => c === 'W').length / 5;
   const p2FormScore = p2Stats.recentForm.split('').filter(c => c === 'W').length / 5;
   p1Prob += (p1FormScore - p2FormScore) * 0.05;
-
   if (isGrandSlam && strengthDiff > 0) p1Prob += 0.03;
-
   p1Prob = Math.max(0.08, Math.min(0.92, p1Prob));
 
   const factors = [strengthDiff > 0, p1FormScore > p2FormScore];
   const agreeing = factors.filter(f => f === (p1Prob > 0.5)).length;
-  const modelAgreement = 35 + (agreeing / factors.length) * 45; // Lower agreement for fallback
+  const modelAgreement = 35 + (agreeing / factors.length) * 45;
 
   return { p1Prob, p2Prob: 1 - p1Prob, modelAgreement };
 }
@@ -622,7 +671,6 @@ function calculateConfidence(
   const agreementMod = (modelAgreement - 50) / 5;
   const volatilityPenalty = -tournamentVariance * 100;
   const strengthBonus = Math.min(8, probabilityStrength * 15);
-
   return Math.max(25, Math.min(88, Math.round(qualityScore + agreementMod + volatilityPenalty + strengthBonus)));
 }
 
@@ -662,7 +710,6 @@ function calculateRisk(confidence: number, edge: number, dataQuality: string, va
   if (dataQuality === 'FALLBACK') score += 25;
   else if (dataQuality === 'LOW') score += 15;
   score += variance * 100;
-
   if (score <= 25) return 'LOW';
   if (score <= 55) return 'MEDIUM';
   return 'HIGH';
@@ -677,11 +724,9 @@ export async function analyzeTennisMatch(
   const suggestions: TennisSuggestion[] = [];
   const warnings: string[] = [];
 
-  // Get stats — tries live API first, falls back to tier data
   const p1Stats = await getPlayerStats(fixture.player1.name, fixture.player1.id, fixture.tournament.surface);
   const p2Stats = await getPlayerStats(fixture.player2.name, fixture.player2.id, fixture.tournament.surface);
 
-  // Data quality
   let dataQuality: 'HIGH' | 'MEDIUM' | 'LOW' | 'FALLBACK';
   if (p1Stats.source === 'LIVE_API' && p2Stats.source === 'LIVE_API') {
     dataQuality = 'HIGH';
@@ -847,7 +892,6 @@ export function formatStartTime(date: Date): string {
   return date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
 }
 
-// Clear the stats cache (call between analysis runs)
 export function clearPlayerStatsCache(): void {
   playerStatsCache.clear();
 }
